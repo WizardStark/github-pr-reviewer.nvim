@@ -610,7 +610,15 @@ end
 
 -- Submit a review with comments and event (APPROVE, REQUEST_CHANGES, or COMMENT)
 function M.submit_review_with_comments(pr_number, event, body, comments, callback)
-  local get_head_cmd = string.format("gh pr view %d --json headRefOid --jq '.headRefOid'", pr_number)
+  local get_head_cmd = string.format(
+    "bash -lc %s",
+    vim.fn.shellescape(
+      string.format(
+        "git rev-parse -q --verify MERGE_HEAD 2>/dev/null || gh pr view %d --json headRefOid --jq '.headRefOid'",
+        pr_number
+      )
+    )
+  )
 
   vim.fn.jobstart(get_head_cmd, {
     stdout_buffered = true,
@@ -748,7 +756,15 @@ function M.add_pr_comment(pr_number, body, callback)
 end
 
 function M.add_review_comment(pr_number, path, line, body, callback, start_line)
-  local get_head_cmd = string.format("gh pr view %d --json headRefOid --jq '.headRefOid'", pr_number)
+  local get_head_cmd = string.format(
+    "bash -lc %s",
+    vim.fn.shellescape(
+      string.format(
+        "git rev-parse -q --verify MERGE_HEAD 2>/dev/null || gh pr view %d --json headRefOid --jq '.headRefOid'",
+        pr_number
+      )
+    )
+  )
 
   vim.fn.jobstart(get_head_cmd, {
     stdout_buffered = true,
@@ -944,7 +960,15 @@ end
 -- Add a pending review comment (part of a review draft)
 -- This creates a single-comment review that can be submitted later
 function M.add_pending_review_comment(pr_number, path, line, body, callback)
-  local get_head_cmd = string.format("gh pr view %d --json headRefOid --jq '.headRefOid'", pr_number)
+  local get_head_cmd = string.format(
+    "bash -lc %s",
+    vim.fn.shellescape(
+      string.format(
+        "git rev-parse -q --verify MERGE_HEAD 2>/dev/null || gh pr view %d --json headRefOid --jq '.headRefOid'",
+        pr_number
+      )
+    )
+  )
 
   vim.fn.jobstart(get_head_cmd, {
     stdout_buffered = true,
@@ -1110,8 +1134,8 @@ function M.get_pending_review_comments(pr_number, callback)
                 for _, comment in ipairs(comments_array) do
                   if comment and comment.path then
                     -- Try multiple fields to get the line number
-                    -- Priority: line > original_line > start_line > position
-                    local line_num = comment.line or comment.original_line or comment.start_line or comment.position
+                    -- Priority: line > original_line > start_line
+                    local line_num = comment.line or comment.original_line or comment.start_line
 
                     -- Ensure it's a valid number
                     if line_num == vim.NIL or type(line_num) ~= "number" then
