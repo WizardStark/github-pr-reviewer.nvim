@@ -13,6 +13,7 @@ M.config = {
   show_inline_diff = true,        -- show inline diff in buffers (old lines as virtual text)
   show_floats = true,             -- show floating windows with info, stats and keymaps
   debug = false,                  -- show debug messages
+  pr_list_limit = 30,             -- max PRs to fetch when listing
   mark_as_viewed_key = "<CR>",    -- key to mark file as viewed and go to next file
   next_hunk_key = "<C-j>",        -- key to jump to next hunk
   prev_hunk_key = "<C-k>",        -- key to jump to previous hunk
@@ -73,6 +74,8 @@ M._float_win_keymaps = nil     -- Keymaps float
 M._buffer_jumped = {}          -- Track if we've already jumped to first change in buffer
 M._buffer_keymaps_saved = {}   -- Track if we've saved keymaps for this buffer
 M._opening_file = false        -- Prevent concurrent file opening operations
+M._update_check_timer = nil    -- Timer for checking remote updates
+M._last_known_commit = nil     -- Last known commit SHA of the PR branch
 
 -- Review buffer state
 M._review_buffer = nil       -- Review buffer number
@@ -452,10 +455,87 @@ local function get_local_pending_comments_for_file(pr_number, file_path)
   return file_comments
 end
 
+-- Check if a line is part of the diff (can receive comments)
+local function is_line_in_diff(bufnr, line)
+  local changed_lines = M._buffer_changes[bufnr]
+  if not changed_lines then
+    return false
+  end
+
+  for _, changed_line in ipairs(changed_lines) do
+    if changed_line == line then
+      return true
+    end
+  end
+
+  return false
+end
+
+-- Check if the PR branch has been updated remotely
+local function check_for_remote_updates()
+  local pr_number = vim.g.pr_review_number
+  if not pr_number then
+    return
+  end
+
+  -- Get current HEAD commit of the PR
+  local cmd = string.format("gh pr view %d --json headRefOid --jq '.headRefOid'", pr_number)
+  vim.fn.jobstart(cmd, {
+    stdout_buffered = true,
+    on_stdout = function(_, data)
+      if not data or not data[1] or data[1] == "" then
+        return
+      end
+
+      local remote_commit = data[1]:gsub("%s+", "")
+
+      -- First check - store the commit
+      if not M._last_known_commit then
+        M._last_known_commit = remote_commit
+        return
+      end
+
+      -- Compare with last known commit
+      if remote_commit ~= M._last_known_commit then
+        vim.schedule(function()
+          vim.notify("⚠️ PR branch has been updated! Use :PRRefresh to sync changes.", vim.log.levels.WARN)
+        end)
+        M._last_known_commit = remote_commit
+      end
+    end,
+  })
+end
+
+-- Start polling for remote updates
+local function start_update_polling()
+  if M._update_check_timer then
+    return -- Already polling
+  end
+
+  -- Check immediately
+  check_for_remote_updates()
+
+  -- Then check every 10 seconds
+  M._update_check_timer = vim.fn.timer_start(10000, function()
+    check_for_remote_updates()
+  end, { ["repeat"] = -1 })
+end
+
+-- Stop polling for remote updates
+local function stop_update_polling()
+  if M._update_check_timer then
+    vim.fn.timer_stop(M._update_check_timer)
+    M._update_check_timer = nil
+  end
+  M._last_known_commit = nil
+end
+
 -- Collect all files from PR with their metadata
 local function collect_pr_files(callback)
   -- First get tracked changes (M, A, D)
-  local cmd = "git diff --name-status HEAD"
+  -- Compare with the base branch of the PR, not HEAD
+  local base_branch = vim.g.pr_review_base_branch or "master"
+  local cmd = string.format("git diff --name-status origin/%s", base_branch)
   vim.fn.jobstart(cmd, {
     stdout_buffered = true,
     on_stdout = function(_, data)
@@ -588,7 +668,9 @@ local function get_changed_lines_for_file(file_path, status, callback)
     -- For new/untracked files, compare with /dev/null
     cmd = string.format("git diff --unified=0 --no-index /dev/null -- %s", vim.fn.shellescape(file_path))
   else
-    cmd = string.format("git diff --unified=0 HEAD -- %s", vim.fn.shellescape(file_path))
+    local merge_base = vim.g.pr_review_merge_base
+    local base_ref = merge_base and merge_base or "HEAD"
+    cmd = string.format("git diff --unified=0 %s -- %s", base_ref, vim.fn.shellescape(file_path))
   end
   vim.fn.jobstart(cmd, {
     stdout_buffered = true,
@@ -649,7 +731,9 @@ get_inline_diff = function(file_path, status, callback)
   if status == "A" or status == "N" then
     cmd = string.format("git diff --unified=0 --no-index /dev/null -- %s", vim.fn.shellescape(file_path))
   else
-    cmd = string.format("git diff --unified=0 HEAD -- %s", vim.fn.shellescape(file_path))
+    local merge_base = vim.g.pr_review_merge_base
+    local base_ref = merge_base and merge_base or "HEAD"
+    cmd = string.format("git diff --unified=0 %s -- %s", base_ref, vim.fn.shellescape(file_path))
   end
 
   vim.fn.jobstart(cmd, {
@@ -855,9 +939,15 @@ local function create_split_view(current_bufnr, file_path)
   -- Try to get base version of the file
   -- Build list of attempts to find the base version
   local base_branch = vim.g.pr_review_base_branch
+  local merge_base = vim.g.pr_review_merge_base
   local attempts = {}
 
-  -- If we have base_branch, try it first
+  -- Prefer merge-base (exact common ancestor, matches GitHub's diff base)
+  if merge_base then
+    table.insert(attempts, string.format("%s:%s", merge_base, file_path))
+  end
+
+  -- If we have base_branch, try it as fallback
   if base_branch then
     table.insert(attempts, string.format("origin/%s:%s", base_branch, file_path))
     table.insert(attempts, string.format("%s:%s", base_branch, file_path))
@@ -1363,8 +1453,9 @@ open_file_safe = function(file, split_cmd)
       vim.api.nvim_set_current_buf(existing_buf)
       -- Don't auto-mark as viewed - user should explicitly mark with mark_as_viewed_key
     else
-      -- Open deleted file from HEAD
-      local cmd = string.format("git show HEAD:%s", vim.fn.shellescape(file.path))
+      -- Open deleted file from merge_base (the PR's base commit, matching GitHub's view)
+      local del_ref = vim.g.pr_review_merge_base or "HEAD"
+      local cmd = string.format("git show %s:%s", del_ref, vim.fn.shellescape(file.path))
       vim.fn.jobstart(cmd, {
         stdout_buffered = true,
         on_stdout = function(_, data)
@@ -2350,12 +2441,16 @@ local function display_comments(bufnr, comments)
     if line_idx < line_count then
       local count = count_comments_at_line(comments, line)
 
-      -- Check if any comment on this line is pending
+      -- Check if any comment on this line is a local draft or pending
+      local has_local_draft = false
       local has_pending = false
       for _, c in ipairs(comments) do
-        if c.line == line and c.is_pending then
-          has_pending = true
-          break
+        if c.line == line then
+          if c.is_local then
+            has_local_draft = true
+          elseif c.is_pending then
+            has_pending = true
+          end
         end
       end
 
@@ -2363,13 +2458,17 @@ local function display_comments(bufnr, comments)
 
       local text
       if M.config.show_icons then
-        if has_pending then
+        if has_local_draft then
+          text = count > 1 and string.format(" 📝 %d comments (draft)", count) or " 📝 1 comment (draft)"
+        elseif has_pending then
           text = count > 1 and string.format(" ⏳ %d comments (pending)", count) or " ⏳ 1 comment (pending)"
         else
           text = count > 1 and string.format(" 💬 %d comments", count) or " 💬 1 comment"
         end
       else
-        if has_pending then
+        if has_local_draft then
+          text = count > 1 and string.format(" [%d comments (draft)]", count) or " [1 comment (draft)]"
+        elseif has_pending then
           text = count > 1 and string.format(" [%d comments (pending)]", count) or " [1 comment (pending)]"
         else
           text = count > 1 and string.format(" [%d comments]", count) or " [1 comment]"
@@ -2410,8 +2509,17 @@ local function display_comments(bufnr, comments)
       end
 
       -- Create custom highlight group for comment indicator
-      local base_hl_name = has_pending and "DiagnosticWarn" or "DiagnosticInfo"
-      local custom_hl_name = has_pending and "PRCommentPending" or "PRCommentInfo"
+      local base_hl_name, custom_hl_name
+      if has_local_draft then
+        base_hl_name = "DiagnosticHint"
+        custom_hl_name = "PRCommentDraft"
+      elseif has_pending then
+        base_hl_name = "DiagnosticWarn"
+        custom_hl_name = "PRCommentPending"
+      else
+        base_hl_name = "DiagnosticInfo"
+        custom_hl_name = "PRCommentInfo"
+      end
       local base_hl = vim.api.nvim_get_hl(0, { name = base_hl_name, link = false })
 
       -- Use line background, or fallback to Normal background if no diff
@@ -3834,6 +3942,12 @@ function M.add_review_comment()
 
   local file_path = get_relative_path(bufnr)
 
+  -- Check if line is part of the diff
+  if not is_line_in_diff(bufnr, cursor_line) then
+    vim.notify("❌ Cannot add comment: line " .. cursor_line .. " is not part of the diff", vim.log.levels.ERROR)
+    return
+  end
+
   -- Check if there are existing comments on this line
   local comments = M._buffer_comments[bufnr] or {}
   local line_comments = {}
@@ -3909,6 +4023,12 @@ function M.add_pending_comment()
   end
 
   local file_path = get_relative_path(bufnr)
+
+  -- Check if line is part of the diff
+  if not is_line_in_diff(bufnr, cursor_line) then
+    vim.notify("❌ Cannot add comment: line " .. cursor_line .. " is not part of the diff", vim.log.levels.ERROR)
+    return
+  end
 
   -- Check if there are existing comments on this line
   local comments = M._buffer_comments[bufnr] or {}
@@ -4706,13 +4826,55 @@ function M.delete_my_comment()
   end)
 end
 
+function M.show_session_info()
+  local session_file = get_session_file()
+  local session_data = load_session()
+
+  local lines = {
+    "Session file: " .. session_file,
+    "",
+  }
+
+  if session_data then
+    table.insert(lines, "Saved session:")
+    table.insert(lines, "  PR #" .. (session_data.pr_number or "nil"))
+    table.insert(lines, "  Base branch: " .. (session_data.base_branch or "nil"))
+    table.insert(lines, "  Previous branch: " .. (session_data.previous_branch or "nil"))
+    table.insert(lines, "  CWD: " .. (session_data.cwd or "nil"))
+    table.insert(lines, "  Viewed files: " .. vim.inspect(session_data.viewed_files or {}))
+    table.insert(lines, "  Pending comments: " .. #(session_data.pending_comments or {}))
+  else
+    table.insert(lines, "No saved session found")
+  end
+
+  table.insert(lines, "")
+  table.insert(lines, "Current state:")
+  table.insert(lines, "  vim.g.pr_review_number: " .. vim.inspect(vim.g.pr_review_number))
+  table.insert(lines, "  Current CWD: " .. vim.fn.getcwd())
+  table.insert(lines, "  Current branch: " .. (git.get_current_branch() or "nil"))
+
+  vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
+end
+
 function M.load_last_session()
+  -- Check if we're on a review branch
+  local current_branch = git.get_current_branch()
+  local on_review_branch = current_branch and current_branch:match("^" .. M.config.branch_prefix)
+
+  if not on_review_branch then
+    vim.notify("Not on a review branch. Use :PR to start a new review.", vim.log.levels.WARN)
+    return
+  end
+
   if vim.g.pr_review_number then
-    vim.notify("Already in review mode. Use :PRReviewCleanup first.", vim.log.levels.WARN)
+    vim.notify("Already in review mode.", vim.log.levels.INFO)
+    -- Just open the review buffer
+    M.open_review_buffer()
     return
   end
 
   local session_data = load_session()
+
   if not session_data then
     vim.notify("No saved session found for this project", vim.log.levels.INFO)
     return
@@ -4724,10 +4886,14 @@ function M.load_last_session()
     return
   end
 
-  vim.notify("Loading review session for PR #" .. session_data.pr_number .. "...", vim.log.levels.INFO)
+  vim.notify("Restoring review session for PR #" .. session_data.pr_number .. "...", vim.log.levels.INFO)
 
   apply_session_data(session_data)
 
+  -- Start polling for remote updates
+  start_update_polling()
+
+  -- Open review buffer and first file
   M.open_review_buffer(function()
     if not open_saved_active_file(session_data) then
       local first_file = #M._review_files_ordered > 0 and M._review_files_ordered[1] or M._review_files[1]
@@ -4919,6 +5085,9 @@ function M.show_pr_info()
         "",
       })
 
+      -- Prepare for CI checks (declare outside block for keymap access)
+      local failed_urls = {}
+
       -- Add CI checks
       if #ci_checks > 0 then
         table.insert(lines, "## CI Checks")
@@ -4939,6 +5108,9 @@ function M.show_pr_info()
             icon = check_fail_icon
             failed = failed + 1
             table.insert(failed_jobs, check.name)
+            if check.detailsUrl then
+              table.insert(failed_urls, { name = check.name, url = check.detailsUrl })
+            end
           else
             icon = check_pending_icon
             pending = pending + 1
@@ -4954,6 +5126,11 @@ function M.show_pr_info()
 
         if failed > 0 then
           table.insert(lines, string.format("%s **Failed jobs:** %s", check_fail_icon, table.concat(failed_jobs, ", ")))
+          -- Add instructions to view details
+          if #failed_urls > 0 then
+            table.insert(lines, "")
+            table.insert(lines, "*Press `o` to open failed check in browser, `y` to copy URL*")
+          end
         end
 
         if pending > 0 then
@@ -4999,6 +5176,32 @@ function M.show_pr_info()
 
       vim.keymap.set("n", "q", close_window, { buffer = buf, nowait = true })
       vim.keymap.set("n", "<Esc>", close_window, { buffer = buf, nowait = true })
+
+      -- Add keymaps for failed checks interaction
+      if #failed_urls > 0 then
+        -- 'o' to open first failed check in browser
+        vim.keymap.set("n", "o", function()
+          if failed_urls[1] then
+            local url = failed_urls[1].url
+            if vim.fn.has("mac") == 1 then
+              vim.fn.jobstart("open " .. vim.fn.shellescape(url), { detach = true })
+            elseif vim.fn.has("win32") == 1 then
+              vim.fn.jobstart('cmd /c start "" ' .. vim.fn.shellescape(url), { detach = true })
+            else
+              vim.fn.jobstart("xdg-open " .. vim.fn.shellescape(url), { detach = true })
+            end
+            vim.notify("Opening: " .. failed_urls[1].name, vim.log.levels.INFO)
+          end
+        end, { buffer = buf, nowait = true, desc = "Open failed check in browser" })
+
+        -- 'y' to copy first failed check URL
+        vim.keymap.set("n", "y", function()
+          if failed_urls[1] then
+            vim.fn.setreg("+", failed_urls[1].url)
+            vim.notify("Copied URL for: " .. failed_urls[1].name, vim.log.levels.INFO)
+          end
+        end, { buffer = buf, nowait = true, desc = "Copy failed check URL" })
+      end
 
       -- Auto-close if user leaves the buffer (e.g., switches windows)
       vim.api.nvim_create_autocmd("BufLeave", {
@@ -5065,7 +5268,11 @@ local function check_and_cleanup_if_needed(callback)
 end
 
 function M.list_review_requests()
-  if git.has_uncommitted_changes() then
+  -- Skip uncommitted changes check if already on a review branch
+  local current_branch = git.get_current_branch()
+  local on_review_branch = current_branch and current_branch:match("^" .. M.config.branch_prefix)
+
+  if not on_review_branch and git.has_uncommitted_changes() then
     vim.notify("Cannot start review: you have uncommitted changes. Please commit or stash them first.",
       vim.log.levels.ERROR)
     return
@@ -5168,7 +5375,7 @@ function M._do_start_review(pr)
         pr.head_branch or "nil",
         pr.head_repo_owner or "nil",
         pr.head_repo_url or "nil"))
-      git.soft_merge(pr.head_branch, pr.head_repo_owner, pr.head_repo_url, function(merge_ok, merge_err, has_conflicts)
+      git.soft_merge(pr.head_branch, pr.head_repo_owner, pr.head_repo_url, function(merge_ok, merge_err, merge_base)
         if not merge_ok then
           vim.notify("Error during soft merge: " .. (merge_err or "unknown"), vim.log.levels.ERROR)
           return
@@ -5176,18 +5383,15 @@ function M._do_start_review(pr)
 
         vim.g.pr_review_number = pr.number
         vim.g.pr_review_base_branch = pr.base_branch
+        vim.g.pr_review_merge_base = merge_base
 
-        if has_conflicts then
-          vim.notify(
-            string.format("⚠️  PR #%s has merge conflicts. Review will show conflicted state.", pr.number),
-            vim.log.levels.WARN
-          )
-        else
-          vim.notify(
-            string.format("✅ Ready to review PR #%s: %s", pr.number, pr.title),
-            vim.log.levels.INFO
-          )
-        end
+        -- Start polling for remote updates
+        start_update_polling()
+
+        vim.notify(
+          string.format("✅ Ready to review PR #%s: %s", pr.number, pr.title),
+          vim.log.levels.INFO
+        )
 
         git.get_modified_files_with_lines(function(files, hunks)
           if files and #files > 0 then
@@ -5366,6 +5570,14 @@ function M.setup(opts)
     M.load_last_session()
   end, { desc = "Load last PR review session" })
 
+  vim.api.nvim_create_user_command("PRSessionInfo", function()
+    M.show_session_info()
+  end, { desc = "Show saved session info" })
+
+  vim.api.nvim_create_user_command("PRRefresh", function()
+    M.refresh_pr_branch()
+  end, { desc = "Refresh PR branch with latest changes" })
+
   vim.api.nvim_create_user_command("PRReviewBuffer", function()
     M.open_review_buffer()
   end, { desc = "Open PR review buffer" })
@@ -5490,7 +5702,11 @@ function M.setup(opts)
 end
 
 function M.review_pr()
-  if git.has_uncommitted_changes() then
+  -- Skip uncommitted changes check if already on a review branch
+  local current_branch = git.get_current_branch()
+  local on_review_branch = current_branch and current_branch:match("^" .. M.config.branch_prefix)
+
+  if not on_review_branch and git.has_uncommitted_changes() then
     vim.notify("Cannot start review: you have uncommitted changes. Please commit or stash them first.",
       vim.log.levels.ERROR)
     return
@@ -5570,7 +5786,7 @@ function M._do_review_pr_with_branch(pr)
         pr.head_branch or "nil",
         pr.head_repo_owner or "nil",
         pr.head_repo_url or "nil"))
-      git.soft_merge(pr.head_branch, pr.head_repo_owner, pr.head_repo_url, function(merge_ok, merge_err, has_conflicts)
+      git.soft_merge(pr.head_branch, pr.head_repo_owner, pr.head_repo_url, function(merge_ok, merge_err, merge_base)
         if not merge_ok then
           vim.notify("Error during soft merge: " .. (merge_err or "unknown"), vim.log.levels.ERROR)
           return
@@ -5578,18 +5794,15 @@ function M._do_review_pr_with_branch(pr)
 
         vim.g.pr_review_number = pr.number
         vim.g.pr_review_base_branch = pr.base_branch
+        vim.g.pr_review_merge_base = merge_base
 
-        if has_conflicts then
-          vim.notify(
-            string.format("⚠️  PR #%s has merge conflicts. Review will show conflicted state.", pr.number),
-            vim.log.levels.WARN
-          )
-        else
-          vim.notify(
-            string.format("✅ Ready to review PR #%s: %s", pr.number, pr.title),
-            vim.log.levels.INFO
-          )
-        end
+        -- Start polling for remote updates
+        start_update_polling()
+
+        vim.notify(
+          string.format("✅ Ready to review PR #%s: %s", pr.number, pr.title),
+          vim.log.levels.INFO
+        )
 
         git.get_modified_files_with_lines(function(files)
           if files and #files > 0 then
@@ -5617,10 +5830,135 @@ function M._do_review_pr_with_branch(pr)
   end)
 end
 
+-- Refresh the PR branch with latest changes
+function M.refresh_pr_branch()
+  local pr_number = vim.g.pr_review_number
+  if not pr_number then
+    vim.notify("Not in review mode", vim.log.levels.WARN)
+    return
+  end
+
+  local base_branch = vim.g.pr_review_base_branch
+  if not base_branch then
+    vim.notify("❌ Base branch not found", vim.log.levels.ERROR)
+    return
+  end
+
+  vim.notify("Refreshing PR branch...", vim.log.levels.INFO)
+
+  -- Fetch latest changes from all remotes
+  git.fetch_all(function(fetch_ok, fetch_err)
+    if not fetch_ok then
+      vim.notify("❌ Failed to fetch: " .. (fetch_err or "unknown"), vim.log.levels.ERROR)
+      return
+    end
+
+    -- Get PR details including fork info
+    local cmd = string.format(
+      "gh pr view %d --json headRefName,headRepositoryOwner,headRepository,isCrossRepository",
+      pr_number
+    )
+    vim.fn.jobstart(cmd, {
+      stdout_buffered = true,
+      on_stdout = function(_, data)
+        if not data or not data[1] or data[1] == "" then
+          vim.schedule(function()
+            vim.notify("❌ Failed to get PR details", vim.log.levels.ERROR)
+          end)
+          return
+        end
+
+        local json_str = table.concat(data, "")
+        local ok, pr_info = pcall(vim.fn.json_decode, json_str)
+        if not ok or not pr_info then
+          vim.schedule(function()
+            vim.notify("❌ Failed to parse PR details", vim.log.levels.ERROR)
+          end)
+          return
+        end
+
+        vim.schedule(function()
+          local head_branch = pr_info.headRefName
+          local head_repo_owner = nil
+          local head_repo_url = nil
+
+          if pr_info.isCrossRepository and pr_info.headRepositoryOwner and pr_info.headRepository then
+            head_repo_owner = pr_info.headRepositoryOwner.login
+            head_repo_url = string.format("https://github.com/%s/%s.git",
+              head_repo_owner, pr_info.headRepository.name)
+          end
+
+          -- Reset to base branch (not the PR branch!) to reconstruct the soft merge state
+          local reset_cmd = string.format("git reset --hard origin/%s", base_branch)
+          vim.fn.jobstart(reset_cmd, {
+            on_exit = function(_, reset_code)
+              vim.schedule(function()
+                if reset_code ~= 0 then
+                  vim.notify("❌ Failed to reset to base branch", vim.log.levels.ERROR)
+                  return
+                end
+
+                -- Remove untracked files left by the previous soft merge
+                -- (git reset --hard only resets tracked files, not new untracked ones)
+                vim.fn.jobstart("git clean -fd", {
+                  on_exit = function()
+                    vim.schedule(function()
+                      -- Re-do the soft merge with the updated PR branch
+                      git.soft_merge(head_branch, head_repo_owner, head_repo_url, function(merge_ok, merge_err, merge_base)
+                        if not merge_ok then
+                          vim.notify("❌ Failed to re-merge PR: " .. (merge_err or "unknown"), vim.log.levels.ERROR)
+                          return
+                        end
+                        vim.g.pr_review_merge_base = merge_base
+
+                        -- Clear all cached data
+                        M._buffer_changes = {}
+                        M._buffer_hunks = {}
+                        M._buffer_comments = {}
+                        M._buffer_stats = {}
+                        M._buffer_jumped = {}
+
+                        -- Re-fetch modified files list
+                        git.get_modified_files_with_lines(function(files)
+                          vim.g.pr_review_modified_files = (files and #files > 0) and vim.tbl_map(function(f)
+                            return { path = f.path, status = f.status }
+                          end, files) or {}
+
+                          -- Reload current buffer
+                          vim.cmd("edit!")
+
+                          -- Reload review buffer with updated file list
+                          if M._review_buffer and vim.api.nvim_buf_is_valid(M._review_buffer) then
+                            M._review_files = {}
+                            M._review_files_ordered = {}
+                            M.open_review_buffer()
+                          end
+
+                          vim.notify("✅ PR refreshed successfully!", vim.log.levels.INFO)
+                        end)
+                      end)
+                    end)
+                  end,
+                })
+              end)
+            end,
+          })
+        end)
+      end,
+    })
+  end)
+end
+
 function M.cleanup_review_branch()
   local current = git.get_current_branch()
   if not current or not current:match("^" .. M.config.branch_prefix) then
     vim.notify("Not on a review branch", vim.log.levels.WARN)
+    return
+  end
+
+  -- Confirm before exiting review
+  local choice = vim.fn.confirm("Exit review and cleanup branch?", "&Yes\n&No", 2)
+  if choice ~= 1 then
     return
   end
 
@@ -5629,6 +5967,7 @@ function M.cleanup_review_branch()
   git.cleanup_review(current, target, function(ok, err)
     if ok then
       delete_session()
+      stop_update_polling()
       reset_review_runtime_state()
 
       vim.notify("Cleaned up review branch, back on: " .. target, vim.log.levels.INFO)
@@ -5812,20 +6151,23 @@ function M.show_review_menu()
 
   if not in_review_mode then
     -- Not in review mode - show PR selection options
+    local items = {}
+
+    -- If has session, make Load the primary option (l key)
+    if has_session then
+      table.insert(items, { key = "l", desc = "Load Last Session",              cmd = function() M.load_last_session() end })
+      table.insert(items, { key = "p", desc = "List Pull Requests",             cmd = function() M.review_pr() end })
+    else
+      table.insert(items, { key = "l", desc = "List Pull Requests",             cmd = function() M.review_pr() end })
+    end
+    table.insert(items, { key = "r", desc = "List Pull Requests with Assignee", cmd = function() M.list_review_requests() end })
+
     sections = {
       {
         title = "Pull Request",
-        items = {
-          { key = "l", desc = "List Pull Requests",               cmd = function() M.review_pr() end },
-          { key = "r", desc = "List Pull Requests with Assignee", cmd = function() M.list_review_requests() end },
-        }
+        items = items,
       },
     }
-
-    if has_session then
-      table.insert(sections[1].items,
-        { key = "s", desc = "Load Last Session", cmd = function() M.load_last_session() end })
-    end
   else
     -- In review mode - show review actions
     sections = {
@@ -5844,6 +6186,7 @@ function M.show_review_menu()
         title = "General",
         items = {
           { key = "b", desc = "Toggle Review Buffer", cmd = function() M.toggle_review_buffer() end },
+          { key = "f", desc = "Refresh PR Branch",    cmd = function() M.refresh_pr_branch() end },
         }
       },
       {

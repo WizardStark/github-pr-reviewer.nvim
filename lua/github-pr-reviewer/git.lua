@@ -151,89 +151,110 @@ function M.add_fork_remote(repo_owner, repo_url, callback)
   })
 end
 
+local function compute_merge_base()
+  local result = vim.fn.system("git merge-base ORIG_HEAD MERGE_HEAD"):gsub("%s+", "")
+  if vim.v.shell_error ~= 0 or result == "" then
+    return nil
+  end
+  return result
+end
+
+-- After merge, checkout all PR files (added/modified) from MERGE_HEAD so the
+-- working tree reflects the PR branch state, not the merged state.
+-- This ensures diffs match GitHub (PR changes only, no base-only changes).
+local function checkout_pr_files_from_merge_head(merge_base, callback)
+  if not merge_base then
+    callback()
+    return
+  end
+  local diff_cmd = string.format("git diff --name-only --diff-filter=AM %s MERGE_HEAD", merge_base)
+  vim.fn.jobstart(diff_cmd, {
+    stdout_buffered = true,
+    on_stdout = function(_, data)
+      local pr_files = {}
+      if data then
+        for _, line in ipairs(data) do
+          if line and line ~= "" then
+            table.insert(pr_files, line)
+          end
+        end
+      end
+      vim.schedule(function()
+        if #pr_files == 0 then
+          callback()
+          return
+        end
+        local files_str = table.concat(vim.tbl_map(vim.fn.shellescape, pr_files), " ")
+        vim.fn.jobstart("git checkout MERGE_HEAD -- " .. files_str, {
+          on_exit = function()
+            vim.schedule(callback)
+          end,
+        })
+      end)
+    end,
+  })
+end
+
+local function do_merge(cmd, callback)
+  local stderr_lines = {}
+  vim.fn.jobstart(cmd, {
+    stderr_buffered = true,
+    on_stderr = function(_, data)
+      if data then
+        for _, line in ipairs(data) do
+          if line and line ~= "" then
+            table.insert(stderr_lines, line)
+          end
+        end
+      end
+    end,
+    on_exit = function(_, code)
+      vim.schedule(function()
+        debug_log(string.format("Debug: Merge exit code = %d", code))
+        local status = vim.fn.system("git status --porcelain")
+        local has_conflicts = status:match("UU ") or status:match("AA ") or status:match("DD ")
+
+        if code == 0 or has_conflicts then
+          -- Compute merge_base before unstaging (MERGE_HEAD cleared by git reset)
+          local merge_base = compute_merge_base()
+
+          -- Checkout all added/modified PR files from MERGE_HEAD so working tree
+          -- reflects the PR branch state (not the merged state with base changes)
+          checkout_pr_files_from_merge_head(merge_base, function()
+            M._unstage_all(function(ok, err)
+              callback(ok, err, merge_base)
+            end)
+          end)
+        else
+          local git_error = #stderr_lines > 0 and table.concat(stderr_lines, "\n") or "unknown error"
+          vim.fn.jobstart("git merge --abort", {
+            on_exit = function()
+              vim.schedule(function()
+                callback(false, "Merge failed: " .. git_error)
+              end)
+            end,
+          })
+        end
+      end)
+    end,
+  })
+end
+
 function M.soft_merge(source_branch, head_repo_owner, head_repo_url, callback)
   -- If head_repo_owner is provided, setup fork remote
   if head_repo_owner and head_repo_url then
     M.add_fork_remote(head_repo_owner, head_repo_url, function(remote)
       local remote_source = remote .. "/" .. source_branch
       local cmd = string.format("git merge --no-commit --no-ff %s", remote_source)
-
       debug_log(string.format("Debug: Merging %s", remote_source))
-
-      vim.fn.jobstart(cmd, {
-        on_exit = function(_, code)
-          vim.schedule(function()
-            debug_log(string.format("Debug: Merge exit code = %d", code))
-            if code == 0 then
-              M._unstage_all(callback)
-            else
-              -- Check if it's a conflict situation
-              local status = vim.fn.system("git status --porcelain")
-              debug_log(string.format("Debug: Git status after merge: %s", status:sub(1, 200)))
-              local has_conflicts = status:match("UU ") or status:match("AA ") or status:match("DD ")
-
-              if has_conflicts then
-                -- Has conflicts, allow review with conflict markers
-                M._unstage_all(function(unstage_ok, unstage_err)
-                  if unstage_ok then
-                    callback(true, nil, true) -- true = has_conflicts
-                  else
-                    callback(false, unstage_err or "Failed to unstage after conflict")
-                  end
-                end)
-              else
-                -- Other merge error, abort
-                vim.fn.jobstart("git merge --abort", {
-                  on_exit = function()
-                    vim.schedule(function()
-                      callback(false, "Merge failed. Aborted.")
-                    end)
-                  end,
-                })
-              end
-            end
-          end)
-        end,
-      })
+      do_merge(cmd, callback)
     end)
   else
     -- Fallback to origin if no owner specified
     local remote_source = "origin/" .. source_branch
     local cmd = string.format("git merge --no-commit --no-ff %s", remote_source)
-
-    vim.fn.jobstart(cmd, {
-      on_exit = function(_, code)
-        vim.schedule(function()
-          if code == 0 then
-            M._unstage_all(callback)
-          else
-            -- Check if it's a conflict situation
-            local status = vim.fn.system("git status --porcelain")
-            local has_conflicts = status:match("UU ") or status:match("AA ") or status:match("DD ")
-
-            if has_conflicts then
-              -- Has conflicts, allow review with conflict markers
-              M._unstage_all(function(unstage_ok, unstage_err)
-                if unstage_ok then
-                  callback(true, nil, true) -- true = has_conflicts
-                else
-                  callback(false, unstage_err or "Failed to unstage after conflict")
-                end
-              end)
-            else
-              -- Other merge error, abort
-              vim.fn.jobstart("git merge --abort", {
-                on_exit = function()
-                  vim.schedule(function()
-                    callback(false, "Merge failed. Aborted.")
-                  end)
-                end,
-              })
-            end
-          end
-        end)
-      end,
-    })
+    debug_log(string.format("Debug: Merging %s", remote_source))
+    do_merge(cmd, callback)
   end
 end
 
@@ -252,7 +273,9 @@ function M._unstage_all(callback)
 end
 
 function M.get_modified_files_with_lines(callback)
-  local result = vim.fn.system("git diff --name-status")
+  local merge_base = vim.g.pr_review_merge_base
+  local base_ref = merge_base and merge_base or "HEAD"
+  local result = vim.fn.system("git diff --name-status " .. base_ref)
   vim.schedule(function()
     debug_log(string.format("Debug: git diff output (first 200 chars): %s", result:sub(1, 200)))
   end)
@@ -291,7 +314,7 @@ function M.get_modified_files_with_lines(callback)
   local pending = #files
   for i, file in ipairs(files) do
     if file.status ~= "D" and file.status ~= "?" then
-      local diff_cmd = string.format("git diff --unified=0 -- %s", vim.fn.shellescape(file.path))
+      local diff_cmd = string.format("git diff --unified=0 %s -- %s", base_ref, vim.fn.shellescape(file.path))
       vim.fn.jobstart(diff_cmd, {
         stdout_buffered = true,
         on_stdout = function(_, data)
