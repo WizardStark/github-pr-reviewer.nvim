@@ -10,6 +10,74 @@ local function debug_log(msg)
   end
 end
 
+function M.get_pr_for_current_branch(callback)
+  local cmd = "gh pr view --json number,title,headRefName,baseRefName,headRepositoryOwner,headRepository,isCrossRepository"
+  local done = false
+
+  local function finish(pr, err)
+    if done then
+      return
+    end
+    done = true
+    callback(pr, err)
+  end
+
+  local job_id = vim.fn.jobstart(cmd, {
+    stdout_buffered = true,
+    on_stdout = function(_, data)
+      if not data or not data[1] or data[1] == "" then
+        vim.schedule(function()
+          finish(nil, "No PR found for the current branch.")
+        end)
+        return
+      end
+
+      local json_str = table.concat(data, "")
+      local ok, pr = pcall(vim.fn.json_decode, json_str)
+      if not ok or not pr then
+        vim.schedule(function()
+          finish(nil, "Failed to parse PR details")
+        end)
+        return
+      end
+
+      -- Check if it's a cross-repository PR (fork)
+      local is_fork = pr.isCrossRepository or false
+      local head_repo_owner = nil
+      local repo_url = nil
+
+      if is_fork and pr.headRepositoryOwner and pr.headRepository then
+        head_repo_owner = pr.headRepositoryOwner.login
+        repo_url = string.format("https://github.com/%s/%s.git",
+                                head_repo_owner,
+                                pr.headRepository.name)
+      end
+
+      vim.schedule(function()
+        finish({
+          number = pr.number,
+          title = pr.title,
+          head_branch = pr.headRefName,
+          base_branch = pr.baseRefName,
+          head_repo_owner = head_repo_owner,
+          head_repo_url = repo_url,
+        }, nil)
+      end)
+    end,
+    on_exit = function(_, code)
+      if code ~= 0 then
+        vim.schedule(function()
+          finish(nil, "gh pr view failed")
+        end)
+      end
+    end,
+  })
+
+  if job_id <= 0 then
+    finish(nil, "Failed to start gh pr view. Make sure gh is installed and authenticated.")
+  end
+end
+
 function M.list_open_prs()
   local pr_reviewer = require("github-pr-reviewer")
   local result = vim.fn.system(

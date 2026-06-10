@@ -165,6 +165,38 @@ function M.add_fork_remote(repo_owner, repo_url, callback)
   })
 end
 
+function M.get_merge_base(base_ref, head_ref)
+  base_ref = base_ref or "master"
+  head_ref = head_ref or "HEAD"
+
+  local candidates = { "origin/" .. base_ref }
+  local seen = { [candidates[1]] = true }
+
+  local remote_refs = vim.fn.system("git for-each-ref --format=%(refname:short) refs/remotes")
+  if vim.v.shell_error == 0 and remote_refs ~= "" then
+    local suffix = "/" .. base_ref
+    for ref in remote_refs:gmatch("[^\r\n]+") do
+      if ref:sub(-#suffix) == suffix and not seen[ref] then
+        table.insert(candidates, ref)
+        seen[ref] = true
+      end
+    end
+  end
+
+  if not seen[base_ref] then
+    table.insert(candidates, base_ref)
+  end
+
+  for _, candidate in ipairs(candidates) do
+    local result = vim.fn.system(string.format("git merge-base %s %s", candidate, head_ref)):gsub("%s+", "")
+    if vim.v.shell_error == 0 and result ~= "" then
+      return result
+    end
+  end
+
+  return nil
+end
+
 local function compute_merge_base()
   local result = vim.fn.system("git merge-base ORIG_HEAD MERGE_HEAD"):gsub("%s+", "")
   if vim.v.shell_error ~= 0 or result == "" then
