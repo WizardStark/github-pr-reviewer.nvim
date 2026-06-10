@@ -4427,9 +4427,6 @@ function M.list_all_comments()
     vim.notify("Not in review mode", vim.log.levels.WARN)
     return
   end
-  if not ensure_full_review_mode("Listing all comments") then
-    return
-  end
 
   -- Fetch ALL comments from GitHub API (not just cached ones)
   github.fetch_pr_comments(pr_number, function(github_comments, err)
@@ -5891,6 +5888,10 @@ function M.setup(opts)
     M.list_pending_comments()
   end, { desc = "List all pending comments and navigate to selected one" })
 
+  vim.api.nvim_create_user_command("PRListComments", function()
+    M.list_all_comments()
+  end, { desc = "List comments and navigate to selected one" })
+
   vim.api.nvim_create_user_command("PRListAllComments", function()
     M.list_all_comments()
   end, { desc = "List all comments (pending + posted) with preview" })
@@ -6678,6 +6679,7 @@ function M.show_review_menu()
         {
           title = "Comment Overlay",
           items = {
+            { key = "l", desc = "List Comments",    cmd = function() M.list_all_comments() end },
             { key = "r", desc = "Reply to Comment", cmd = function() M.reply_to_comment() end },
             { key = "e", desc = "Exit Overlay",     cmd = function() M.cleanup_review_branch() end },
           }
