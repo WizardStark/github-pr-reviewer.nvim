@@ -2752,6 +2752,33 @@ local function get_anchored_comment_threads(bufnr)
   return threads
 end
 
+local function get_comment_thread_at_cursor(bufnr, cursor_line)
+  local comments = M._buffer_comments[bufnr]
+  if not comments or #comments == 0 then
+    return {}, nil
+  end
+
+  for _, thread in ipairs(get_anchored_comment_threads(bufnr)) do
+    if thread.line == cursor_line then
+      return thread.comments, thread
+    end
+  end
+
+  local line_comments = get_comments_for_line(comments, cursor_line)
+  if #line_comments == 0 then
+    return {}, nil
+  end
+
+  return line_comments, {
+    bufnr = bufnr,
+    path = get_relative_path(bufnr),
+    line = cursor_line,
+    original_line = cursor_line,
+    comments = line_comments,
+    first_comment = line_comments[1],
+  }
+end
+
 local function display_comments(bufnr, comments)
   vim.api.nvim_buf_clear_namespace(bufnr, ns_id, 0, -1)
   M._buffer_comment_threads[bufnr] = {}
@@ -2883,25 +2910,8 @@ function M.show_comments_at_cursor()
   end
 
   local bufnr = vim.api.nvim_get_current_buf()
-  local comments = M._buffer_comments[bufnr]
-  if not comments or #comments == 0 then
-    return
-  end
-
   local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
-  local anchored_threads = get_anchored_comment_threads(bufnr)
-  local line_comments = nil
-
-  for _, thread in ipairs(anchored_threads) do
-    if thread.line == cursor_line then
-      line_comments = thread.comments
-      break
-    end
-  end
-
-  if not line_comments then
-    line_comments = get_comments_for_line(comments, cursor_line)
-  end
+  local line_comments = get_comment_thread_at_cursor(bufnr, cursor_line)
 
   if #line_comments == 0 then
     return
@@ -3024,9 +3034,10 @@ function M.add_reaction_to_comment()
   end
 
   local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
+  local thread_comments = get_comment_thread_at_cursor(bufnr, cursor_line)
   local line_comments = {}
-  for _, comment in ipairs(comments) do
-    if comment.line == cursor_line and not comment.is_pending and not comment.is_local then
+  for _, comment in ipairs(thread_comments) do
+    if not comment.is_pending and not comment.is_local then
       table.insert(line_comments, comment)
     end
   end
@@ -5012,12 +5023,7 @@ function M.reply_to_comment()
   end
 
   local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
-  local line_comments = {}
-  for _, comment in ipairs(comments) do
-    if comment.line == cursor_line then
-      table.insert(line_comments, comment)
-    end
-  end
+  local line_comments, thread = get_comment_thread_at_cursor(bufnr, cursor_line)
 
   if #line_comments == 0 then
     vim.notify("No comments on this line", vim.log.levels.WARN)
@@ -5048,7 +5054,7 @@ function M.reply_to_comment()
     end, {
       pr_number = pr_number,
       file_path = file_path,
-      line = cursor_line,
+      line = (thread and thread.original_line) or comment.line or cursor_line,
       action = "reply",
       comment_id = comment.id,
     })
@@ -6028,6 +6034,97 @@ function M._do_start_review(pr)
   end)
 end
 
+-- Re-anchor comment overlay indicators by stashing, reloading on clean content, and popping stash
+function M.reanchor_comment_overlay()
+  if vim.g.pr_review_mode ~= "comment_overlay" then
+    vim.notify("Re-anchoring is only available in comment overlay mode", vim.log.levels.WARN)
+    return
+  end
+
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].modified then
+      vim.notify("Save or discard modified buffers before re-anchoring comment overlay", vim.log.levels.WARN)
+      return
+    end
+  end
+
+  local function reload_overlay_buffers()
+    vim.notify("Reloading comments on clean content...", vim.log.levels.INFO)
+    vim.cmd("checktime")
+
+    local current_win = vim.api.nvim_get_current_win()
+    local current_buf = vim.api.nvim_get_current_buf()
+    local targets = {}
+    local seen = {}
+
+    local function add_target(bufnr)
+      if bufnr and bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr) and not seen[bufnr] then
+        seen[bufnr] = true
+        table.insert(targets, bufnr)
+      end
+    end
+
+    add_target(current_buf)
+
+    for _, file in ipairs(M._review_files or {}) do
+      if file.path and file.path ~= "" then
+        local abs_path = vim.fn.fnamemodify(file.path, ":p")
+        local bufnr = vim.fn.bufadd(abs_path)
+        if bufnr > 0 then
+          pcall(vim.fn.bufload, bufnr)
+          add_target(bufnr)
+        end
+      end
+    end
+
+    for _, bufnr in ipairs(targets) do
+      M.load_comments_for_buffer(bufnr, true)
+    end
+
+    if current_win and vim.api.nvim_win_is_valid(current_win) then
+      vim.api.nvim_set_current_win(current_win)
+    end
+  end
+
+  if not git.has_uncommitted_changes() then
+    reload_overlay_buffers()
+    return
+  end
+
+  local choice = vim.fn.confirm("Stash local changes to re-anchor comments?", "&Yes\n&No", 2)
+  if choice ~= 1 then
+    return
+  end
+
+  vim.notify("Stashing local changes...", vim.log.levels.INFO)
+  vim.fn.jobstart("git stash push -u -m 'PR-Reviewer auto-stash for re-anchoring'", {
+    on_exit = function(_, code)
+      vim.schedule(function()
+        if code ~= 0 then
+          vim.notify("Failed to stash changes. Aborting re-anchor.", vim.log.levels.ERROR)
+          return
+        end
+
+        reload_overlay_buffers()
+
+        vim.notify("Restoring local changes from stash...", vim.log.levels.INFO)
+        vim.fn.jobstart("git stash pop", {
+          on_exit = function(_, pop_code)
+            vim.schedule(function()
+              vim.cmd("checktime")
+              if pop_code ~= 0 then
+                vim.notify("Stash pop had conflicts or failed. Please check 'git stash list'.", vim.log.levels.WARN)
+              else
+                vim.notify("Successfully re-anchored comments and restored changes.", vim.log.levels.INFO)
+              end
+            end)
+          end
+        })
+      end)
+    end
+  })
+end
+
 -- Start comments mode for the current branch
 function M.start_comment_overlay()
   vim.notify("Resolving PR for current branch...", vim.log.levels.INFO)
@@ -6139,6 +6236,10 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("PRCommentOverlay", function()
     M.start_comment_overlay()
   end, { desc = "Enable comment overlay for the PR on current branch" })
+
+  vim.api.nvim_create_user_command("PRReanchorCommentOverlay", function()
+    M.reanchor_comment_overlay()
+  end, { desc = "Re-anchor comment overlay by stashing and reloading on clean content" })
 
   vim.api.nvim_create_user_command("PRReview", function()
     M.review_pr()
