@@ -75,6 +75,7 @@ M._float_win_buffer = nil      -- Buffer info float (hunks, stats, comments)
 M._float_win_keymaps = nil     -- Keymaps float
 M._buffer_jumped = {}          -- Track if we've already jumped to first change in buffer
 M._buffer_keymaps_saved = {}   -- Track if we've saved keymaps for this buffer
+M._buffer_comment_threads = {} -- Extmark-anchored comment threads per buffer
 M._comment_request_ids = {}    -- Track latest async comment load per buffer
 M._comment_request_seq = 0     -- Monotonic sequence for async comment loads
 M._opening_file = false        -- Prevent concurrent file opening operations
@@ -265,6 +266,7 @@ local function reset_review_runtime_state()
   M._drafts = {}
   M._buffer_jumped = {}
   M._buffer_keymaps_saved = {}
+  M._buffer_comment_threads = {}
   M._comment_request_ids = {}
   M._review_files = {}
   M._review_files_ordered = {}
@@ -2716,8 +2718,43 @@ local function format_reactions_for_line(comments, line)
   return ""
 end
 
+local function get_anchored_comment_threads(bufnr)
+  local threads = {}
+  local thread_map = M._buffer_comment_threads[bufnr] or {}
+
+  for extmark_id, thread in pairs(thread_map) do
+    if thread and vim.api.nvim_buf_is_valid(bufnr) then
+      local pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id, extmark_id, {})
+      if pos and #pos > 0 then
+        table.insert(threads, {
+          extmark_id = extmark_id,
+          bufnr = bufnr,
+          path = thread.path,
+          original_line = thread.original_line,
+          line = pos[1] + 1,
+          comments = thread.comments,
+          first_comment = thread.first_comment,
+        })
+      end
+    end
+  end
+
+  table.sort(threads, function(a, b)
+    if a.path ~= b.path then
+      return a.path < b.path
+    end
+    if a.line ~= b.line then
+      return a.line < b.line
+    end
+    return tostring(a.extmark_id) < tostring(b.extmark_id)
+  end)
+
+  return threads
+end
+
 local function display_comments(bufnr, comments)
   vim.api.nvim_buf_clear_namespace(bufnr, ns_id, 0, -1)
+  M._buffer_comment_threads[bufnr] = {}
 
   local lines_with_comments = {}
   for _, comment in ipairs(comments) do
@@ -2824,10 +2861,18 @@ local function display_comments(bufnr, comments)
         bg = comment_bg,
       })
 
-      vim.api.nvim_buf_set_extmark(bufnr, ns_id, line_idx, 0, {
+      local extmark_id = vim.api.nvim_buf_set_extmark(bufnr, ns_id, line_idx, 0, {
         virt_text = { { text, custom_hl_name } },
         virt_text_pos = "eol",
+        right_gravity = false,
       })
+
+      M._buffer_comment_threads[bufnr][extmark_id] = {
+        path = get_relative_path(bufnr),
+        original_line = line,
+        comments = vim.deepcopy(line_comments),
+        first_comment = line_comments[1],
+      }
     end
   end
 end
@@ -2844,7 +2889,19 @@ function M.show_comments_at_cursor()
   end
 
   local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
-  local line_comments = get_comments_for_line(comments, cursor_line)
+  local anchored_threads = get_anchored_comment_threads(bufnr)
+  local line_comments = nil
+
+  for _, thread in ipairs(anchored_threads) do
+    if thread.line == cursor_line then
+      line_comments = thread.comments
+      break
+    end
+  end
+
+  if not line_comments then
+    line_comments = get_comments_for_line(comments, cursor_line)
+  end
 
   if #line_comments == 0 then
     return
@@ -3088,6 +3145,7 @@ function M.load_comments_for_buffer(bufnr, force_reload)
         end, 50)
       else
         M._buffer_comments[bufnr] = nil
+        M._buffer_comment_threads[bufnr] = nil
         vim.schedule(function()
           if request_is_current() then
             vim.api.nvim_buf_clear_namespace(bufnr, ns_id, 0, -1)
@@ -4530,9 +4588,18 @@ local function navigate_to_comment_location(comment, notify_message)
     end
   else
     vim.cmd("edit " .. file_path)
+    found_buf = vim.api.nvim_get_current_buf()
   end
 
-  vim.api.nvim_win_set_cursor(0, { comment.line, 0 })
+  local target_line = comment.line
+  if comment.extmark_id and found_buf and vim.api.nvim_buf_is_valid(found_buf) then
+    local pos = vim.api.nvim_buf_get_extmark_by_id(found_buf, ns_id, comment.extmark_id, {})
+    if pos and #pos > 0 then
+      target_line = pos[1] + 1
+    end
+  end
+
+  vim.api.nvim_win_set_cursor(0, { target_line, 0 })
   vim.cmd("normal! zz")
 
   if notify_message then
@@ -4619,6 +4686,25 @@ local function collect_comment_locations(comments)
   local locations = {}
   local seen = {}
 
+  for bufnr, _ in pairs(M._buffer_comment_threads) do
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      for _, thread in ipairs(get_anchored_comment_threads(bufnr)) do
+        local key = string.format("%s:%s", thread.path or "", thread.original_line or thread.line)
+        if thread.path and thread.line and not seen[key] then
+          seen[key] = true
+          table.insert(locations, {
+            path = thread.path,
+            line = thread.line,
+            original_line = thread.original_line,
+            first_comment = thread.first_comment,
+            bufnr = thread.bufnr,
+            extmark_id = thread.extmark_id,
+          })
+        end
+      end
+    end
+  end
+
   for _, comment in ipairs(comments or {}) do
     if comment.path and comment.line then
       local key = string.format("%s:%s", comment.path, comment.line)
@@ -4627,11 +4713,19 @@ local function collect_comment_locations(comments)
         table.insert(locations, {
           path = comment.path,
           line = comment.line,
+          original_line = comment.line,
           first_comment = comment,
         })
       end
     end
   end
+
+  table.sort(locations, function(a, b)
+    if a.path ~= b.path then
+      return a.path < b.path
+    end
+    return a.line < b.line
+  end)
 
   return locations
 end
@@ -6341,6 +6435,7 @@ function M.setup(opts)
       M._buffer_keymaps_saved[args.buf] = nil
       M._buffer_jumped[args.buf] = nil
       M._comment_request_ids[args.buf] = nil
+      M._buffer_comment_threads[args.buf] = nil
       M._buffer_comments[args.buf] = nil
       M._buffer_changes[args.buf] = nil
       M._buffer_hunks[args.buf] = nil
