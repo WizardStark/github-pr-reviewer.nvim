@@ -559,6 +559,35 @@ function M.fetch_pr_global_comments(pr_number, callback)
   })
 end
 
+local function attach_reply_metadata(comments)
+  local comment_by_id = {}
+  for _, comment in ipairs(comments) do
+    if comment.id then
+      comment_by_id[tostring(comment.id)] = comment
+    end
+  end
+
+  local changed = true
+  while changed do
+    changed = false
+    for _, comment in ipairs(comments) do
+      if comment.in_reply_to_id then
+        local parent = comment_by_id[tostring(comment.in_reply_to_id)]
+        if parent then
+          if not comment.path and parent.path then
+            comment.path = parent.path
+            changed = true
+          end
+          if not comment.line and parent.line then
+            comment.line = parent.line
+            changed = true
+          end
+        end
+      end
+    end
+  end
+end
+
 function M.fetch_pr_comments(pr_number, callback)
   if M._comments_cache[pr_number] then
     callback(M._comments_cache[pr_number], nil)
@@ -605,6 +634,8 @@ function M.fetch_pr_comments(pr_number, callback)
           end
         end
       end
+
+      attach_reply_metadata(comments)
 
       -- Fetch reactions for all comments
       if #comments == 0 then

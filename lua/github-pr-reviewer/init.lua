@@ -2641,56 +2641,6 @@ end
 
 local format_comment_reactions
 
-local function build_overlay_comment_virt_lines(comments, custom_hl_name)
-  local virt_lines = {}
-  local comment_by_id = {}
-
-  for _, comment in ipairs(comments) do
-    if comment.id then
-      comment_by_id[tostring(comment.id)] = comment
-    end
-  end
-
-  for idx, comment in ipairs(comments) do
-    local parent = comment.in_reply_to_id and comment_by_id[tostring(comment.in_reply_to_id)] or nil
-    local depth = parent and 1 or 0
-    local base_indent = depth == 1 and "    " or "  "
-    local prefix = depth == 1 and "↳ " or "• "
-    local timestamp = format_comment_timestamp(comment)
-    local status = comment.is_local and "draft" or (comment.is_pending and "pending" or nil)
-    local header = base_indent .. prefix .. (comment.user or "unknown")
-
-    if status then
-      header = header .. " [" .. status .. "]"
-    end
-
-    local header_chunks = { { header, custom_hl_name } }
-    if timestamp ~= "" then
-      table.insert(header_chunks, { "  " .. timestamp, "Comment" })
-    end
-    table.insert(virt_lines, header_chunks)
-
-    for _, body_line in ipairs(get_comment_body_lines(comment)) do
-      table.insert(virt_lines, {
-        { base_indent .. "  " .. body_line, "Comment" },
-      })
-    end
-
-    local reactions = format_comment_reactions(comment)
-    if reactions ~= "" then
-      table.insert(virt_lines, {
-        { base_indent .. "  " .. reactions, custom_hl_name },
-      })
-    end
-
-    if idx < #comments then
-      table.insert(virt_lines, { { "", "Normal" } })
-    end
-  end
-
-  return virt_lines
-end
-
 -- Map GitHub reaction content to emoji
 local reaction_emoji_map = {
   ["+1"] = "👍",
@@ -2874,16 +2824,10 @@ local function display_comments(bufnr, comments)
         bg = comment_bg,
       })
 
-      local extmark_opts = {
+      vim.api.nvim_buf_set_extmark(bufnr, ns_id, line_idx, 0, {
         virt_text = { { text, custom_hl_name } },
         virt_text_pos = "eol",
-      }
-
-      if vim.g.pr_review_mode == "comment_overlay" then
-        extmark_opts.virt_lines = build_overlay_comment_virt_lines(line_comments, custom_hl_name)
-      end
-
-      vim.api.nvim_buf_set_extmark(bufnr, ns_id, line_idx, 0, extmark_opts)
+      })
     end
   end
 end
@@ -2906,26 +2850,42 @@ function M.show_comments_at_cursor()
     return
   end
 
+  local comment_by_id = {}
+  for _, comment in ipairs(line_comments) do
+    if comment.id then
+      comment_by_id[tostring(comment.id)] = comment
+    end
+  end
+
   local lines = {}
   for i, comment in ipairs(line_comments) do
     if i > 1 then
       table.insert(lines, string.rep("─", 40))
     end
-    if M.config.show_icons then
-      table.insert(lines, string.format("👤 %s", comment.user))
-    else
-      table.insert(lines, string.format("@%s", comment.user))
+
+    local parent = comment.in_reply_to_id and comment_by_id[tostring(comment.in_reply_to_id)] or nil
+    local prefix = parent and "↳ " or ""
+    local timestamp = format_comment_timestamp(comment)
+    local status = comment.is_local and "draft" or (comment.is_pending and "pending" or nil)
+    local header = prefix .. (M.config.show_icons and string.format("👤 %s", comment.user) or string.format("@%s", comment.user))
+
+    if status then
+      header = header .. string.format(" [%s]", status)
     end
-    table.insert(lines, "")
-    for body_line in comment.body:gmatch("[^\r\n]+") do
-      table.insert(lines, body_line)
+    if timestamp ~= "" then
+      header = header .. string.format(" · %s", timestamp)
     end
 
-    -- Add reactions if present
+    table.insert(lines, header)
+    table.insert(lines, "")
+    for _, body_line in ipairs(get_comment_body_lines(comment)) do
+      table.insert(lines, (parent and "  " or "") .. body_line)
+    end
+
     local reactions = format_comment_reactions(comment)
     if reactions ~= "" then
       table.insert(lines, "")
-      table.insert(lines, reactions)
+      table.insert(lines, (parent and "  " or "") .. reactions)
     end
   end
 
