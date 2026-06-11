@@ -2639,6 +2639,8 @@ local function format_comment_timestamp(comment)
   return created_at:gsub("T", " "):gsub("Z$", " UTC")
 end
 
+local format_comment_reactions
+
 local function build_overlay_comment_virt_lines(comments, custom_hl_name)
   local virt_lines = {}
   local comment_by_id = {}
@@ -2702,7 +2704,7 @@ local reaction_emoji_map = {
 }
 
 -- Format reactions for a single comment
-local function format_comment_reactions(comment)
+function format_comment_reactions(comment)
   if not comment.reactions or type(comment.reactions) ~= "table" or #comment.reactions == 0 then
     return ""
   end
