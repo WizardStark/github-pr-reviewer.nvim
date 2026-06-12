@@ -52,6 +52,7 @@ local load_changes_for_buffer
 local load_inline_diff_for_buffer
 local normalize_local_pending_comments
 local serialize_pending_comments
+local is_comment_overlay_mode
 
 -- Debug logging helper
 local function debug_log(msg)
@@ -1947,7 +1948,7 @@ function M.refresh_review_buffer()
 end
 
 -- Toggle review buffer (open/close)
-local function is_comment_overlay_mode()
+is_comment_overlay_mode = function()
   return vim.g.pr_review_mode == "comment_overlay"
 end
 
