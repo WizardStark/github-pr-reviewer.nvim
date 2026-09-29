@@ -52,7 +52,6 @@ local load_changes_for_buffer
 local load_inline_diff_for_buffer
 local normalize_local_pending_comments
 local serialize_pending_comments
-local is_comment_overlay_mode
 
 -- Debug logging helper
 local function debug_log(msg)
@@ -76,9 +75,6 @@ M._float_win_buffer = nil      -- Buffer info float (hunks, stats, comments)
 M._float_win_keymaps = nil     -- Keymaps float
 M._buffer_jumped = {}          -- Track if we've already jumped to first change in buffer
 M._buffer_keymaps_saved = {}   -- Track if we've saved keymaps for this buffer
-M._buffer_comment_threads = {} -- Extmark-anchored comment threads per buffer
-M._comment_request_ids = {}    -- Track latest async comment load per buffer
-M._comment_request_seq = 0     -- Monotonic sequence for async comment loads
 M._inline_diff_request_ids = {} -- Track latest async inline diff load per buffer
 M._inline_diff_request_seq = 0   -- Monotonic sequence for async inline diff loads
 M._opening_file = false        -- Prevent concurrent file opening operations
@@ -115,13 +111,10 @@ local function save_session()
 
   local session_data = {
     pr_number = vim.g.pr_review_number,
-    review_mode = vim.g.pr_review_mode,
     base_branch = vim.g.pr_review_base_branch,
     previous_branch = vim.g.pr_review_previous_branch,
-    current_branch = git.get_current_branch(),
     review_branch = vim.g.pr_review_branch,
     review_repo_root = vim.g.pr_review_repo_root,
-    merge_base = vim.g.pr_review_merge_base,
     modified_files = vim.g.pr_review_modified_files,
     viewed_files = M._viewed_files,
     pending_comments = serialize_pending_comments(M._local_pending_comments),
@@ -250,12 +243,10 @@ end
 
 local function reset_review_runtime_state()
   vim.g.pr_review_number = nil
-  vim.g.pr_review_mode = nil
   vim.g.pr_review_base_branch = nil
   vim.g.pr_review_previous_branch = nil
   vim.g.pr_review_branch = nil
   vim.g.pr_review_repo_root = nil
-  vim.g.pr_review_merge_base = nil
   vim.g.pr_review_modified_files = nil
 
   github.clear_cache()
@@ -269,8 +260,6 @@ local function reset_review_runtime_state()
   M._drafts = {}
   M._buffer_jumped = {}
   M._buffer_keymaps_saved = {}
-  M._buffer_comment_threads = {}
-  M._comment_request_ids = {}
   M._review_files = {}
   M._review_files_ordered = {}
   M._review_filter = "all"
@@ -388,36 +377,11 @@ local function open_saved_active_file(session_data)
 end
 
 local function apply_session_data(session_data)
-  local review_mode = session_data.review_mode or (session_data.review_branch and "review_branch") or nil
-  local merge_base = session_data.merge_base
-
-  if review_mode == "comment_overlay" and session_data.current_branch then
-    local current_branch = git.get_current_branch()
-    if current_branch ~= session_data.current_branch then
-      vim.notify(
-        string.format("Saved comment-addressing session was created on branch '%s', but current branch is '%s'.",
-          session_data.current_branch, current_branch or "nil"),
-        vim.log.levels.WARN
-      )
-      return false
-    end
-  end
-
-  if not merge_base and review_mode == "comment_overlay" and session_data.base_branch then
-    merge_base = git.get_merge_base(session_data.base_branch, "HEAD")
-    if not merge_base then
-      vim.notify("Failed to restore comment-addressing session merge base", vim.log.levels.WARN)
-      return false
-    end
-  end
-
   vim.g.pr_review_number = session_data.pr_number
-  vim.g.pr_review_mode = review_mode
   vim.g.pr_review_base_branch = session_data.base_branch
   vim.g.pr_review_previous_branch = session_data.previous_branch
   vim.g.pr_review_branch = session_data.review_branch
   vim.g.pr_review_repo_root = session_data.review_repo_root
-  vim.g.pr_review_merge_base = merge_base
   vim.g.pr_review_modified_files = session_data.modified_files
 
   M._viewed_files = session_data.viewed_files or {}
@@ -433,8 +397,6 @@ local function apply_session_data(session_data)
   if session_data.show_floats ~= nil then
     M.config.show_floats = session_data.show_floats
   end
-
-  return true
 end
 
 -- Forward declarations
@@ -1897,11 +1859,6 @@ function M.open_review_buffer(callback)
     return
   end
 
-  if is_comment_overlay_mode() then
-    vim.notify("Review buffer is not used in comment overlay mode", vim.log.levels.INFO)
-    return
-  end
-
   -- Collect files if not already collected
   if #M._review_files == 0 then
     collect_pr_files(function(files)
@@ -1999,26 +1956,9 @@ function M.refresh_review_buffer()
 end
 
 -- Toggle review buffer (open/close)
-is_comment_overlay_mode = function()
-  return vim.g.pr_review_mode == "comment_overlay"
-end
-
-local function ensure_full_review_mode(action_name)
-  if is_comment_overlay_mode() then
-    vim.notify((action_name or "This action") .. " is not available in comment overlay mode", vim.log.levels.INFO)
-    return false
-  end
-  return true
-end
-
 function M.toggle_review_buffer()
   if not vim.g.pr_review_number then
     vim.notify("Not in review mode", vim.log.levels.WARN)
-    return
-  end
-
-  if is_comment_overlay_mode() then
-    vim.notify("Review buffer is not used in comment overlay mode", vim.log.levels.INFO)
     return
   end
 
@@ -2035,9 +1975,9 @@ end
 
 -- Setup global navigation keymaps (work during review mode only)
 local function setup_global_review_keymaps()
-  -- File navigation keymaps (global, but only work in full review mode)
+  -- File navigation keymaps (global, but only work in review mode)
   vim.keymap.set("n", M.config.next_file_key, function()
-    if vim.g.pr_review_number and vim.g.pr_review_mode ~= "comment_overlay" then
+    if vim.g.pr_review_number then
       M.next_file()
     else
       vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(M.config.next_file_key, true, false, true), "n", false)
@@ -2045,7 +1985,7 @@ local function setup_global_review_keymaps()
   end, { desc = "Go to next file (PR review mode)" })
 
   vim.keymap.set("n", M.config.prev_file_key, function()
-    if vim.g.pr_review_number and vim.g.pr_review_mode ~= "comment_overlay" then
+    if vim.g.pr_review_number then
       M.prev_file()
     else
       vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(M.config.prev_file_key, true, false, true), "n", false)
@@ -2054,7 +1994,7 @@ local function setup_global_review_keymaps()
 
   -- Toggle review buffer
   vim.keymap.set("n", M.config.review_buffer.toggle_key, function()
-    if vim.g.pr_review_number and vim.g.pr_review_mode ~= "comment_overlay" then
+    if vim.g.pr_review_number then
       M.toggle_review_buffer()
     else
       vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(M.config.review_buffer.toggle_key, true, false, true), "n",
@@ -2064,7 +2004,7 @@ local function setup_global_review_keymaps()
 end
 
 update_changes_float = function()
-  if not vim.g.pr_review_number or vim.g.pr_review_mode == "comment_overlay" then
+  if not vim.g.pr_review_number then
     close_float_wins()
     return
   end
@@ -2559,15 +2499,6 @@ load_changes_for_buffer = function(bufnr)
     return
   end
 
-  if vim.g.pr_review_mode == "comment_overlay" then
-    M._buffer_changes[bufnr] = nil
-    M._buffer_hunks[bufnr] = nil
-    vim.api.nvim_buf_clear_namespace(bufnr, changes_ns_id, 0, -1)
-    vim.api.nvim_buf_clear_namespace(bufnr, hunk_hints_ns_id, 0, -1)
-    close_float_wins()
-    return
-  end
-
   local file_path = get_relative_path(bufnr)
 
   -- Find status from review files
@@ -2640,61 +2571,6 @@ local function count_comments_at_line(comments, line)
   return count
 end
 
-local function sort_comments_for_display(comments)
-  table.sort(comments, function(a, b)
-    local a_line = a.line or math.huge
-    local b_line = b.line or math.huge
-    if a_line ~= b_line then
-      return a_line < b_line
-    end
-
-    local a_created = a.created_at or ""
-    local b_created = b.created_at or ""
-    if a_created ~= b_created then
-      return a_created < b_created
-    end
-
-    local a_reply = a.in_reply_to_id and 1 or 0
-    local b_reply = b.in_reply_to_id and 1 or 0
-    if a_reply ~= b_reply then
-      return a_reply < b_reply
-    end
-
-    return tostring(a.id or "") < tostring(b.id or "")
-  end)
-
-  return comments
-end
-
-local function get_comments_for_line(comments, line)
-  local line_comments = {}
-  for _, comment in ipairs(comments or {}) do
-    if comment.line == line then
-      table.insert(line_comments, comment)
-    end
-  end
-  return sort_comments_for_display(line_comments)
-end
-
-local function get_comment_body_lines(comment)
-  local body = (comment and comment.body) or ""
-  local lines = vim.split(body, "\n", { plain = true })
-  if #lines == 0 then
-    return { "" }
-  end
-  return lines
-end
-
-local function format_comment_timestamp(comment)
-  local created_at = comment and comment.created_at
-  if not created_at or created_at == "" then
-    return ""
-  end
-  return created_at:gsub("T", " "):gsub("Z$", " UTC")
-end
-
-local format_comment_reactions
-
 -- Map GitHub reaction content to emoji
 local reaction_emoji_map = {
   ["+1"] = "👍",
@@ -2708,7 +2584,7 @@ local reaction_emoji_map = {
 }
 
 -- Format reactions for a single comment
-function format_comment_reactions(comment)
+local function format_comment_reactions(comment)
   if not comment.reactions or type(comment.reactions) ~= "table" or #comment.reactions == 0 then
     return ""
   end
@@ -2770,70 +2646,8 @@ local function format_reactions_for_line(comments, line)
   return ""
 end
 
-local function get_anchored_comment_threads(bufnr)
-  local threads = {}
-  local thread_map = M._buffer_comment_threads[bufnr] or {}
-
-  for extmark_id, thread in pairs(thread_map) do
-    if thread and vim.api.nvim_buf_is_valid(bufnr) then
-      local pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id, extmark_id, {})
-      if pos and #pos > 0 then
-        table.insert(threads, {
-          extmark_id = extmark_id,
-          bufnr = bufnr,
-          path = thread.path,
-          original_line = thread.original_line,
-          line = pos[1] + 1,
-          comments = thread.comments,
-          first_comment = thread.first_comment,
-        })
-      end
-    end
-  end
-
-  table.sort(threads, function(a, b)
-    if a.path ~= b.path then
-      return a.path < b.path
-    end
-    if a.line ~= b.line then
-      return a.line < b.line
-    end
-    return tostring(a.extmark_id) < tostring(b.extmark_id)
-  end)
-
-  return threads
-end
-
-local function get_comment_thread_at_cursor(bufnr, cursor_line)
-  local comments = M._buffer_comments[bufnr]
-  if not comments or #comments == 0 then
-    return {}, nil
-  end
-
-  for _, thread in ipairs(get_anchored_comment_threads(bufnr)) do
-    if thread.line == cursor_line then
-      return thread.comments, thread
-    end
-  end
-
-  local line_comments = get_comments_for_line(comments, cursor_line)
-  if #line_comments == 0 then
-    return {}, nil
-  end
-
-  return line_comments, {
-    bufnr = bufnr,
-    path = get_relative_path(bufnr),
-    line = cursor_line,
-    original_line = cursor_line,
-    comments = line_comments,
-    first_comment = line_comments[1],
-  }
-end
-
 local function display_comments(bufnr, comments)
   vim.api.nvim_buf_clear_namespace(bufnr, ns_id, 0, -1)
-  M._buffer_comment_threads[bufnr] = {}
 
   local lines_with_comments = {}
   for _, comment in ipairs(comments) do
@@ -2846,21 +2660,22 @@ local function display_comments(bufnr, comments)
   for line, _ in pairs(lines_with_comments) do
     local line_idx = line - 1
     if line_idx < line_count then
-      local line_comments = get_comments_for_line(comments, line)
-      local count = #line_comments
+      local count = count_comments_at_line(comments, line)
 
       -- Check if any comment on this line is a local draft or pending
       local has_local_draft = false
       local has_pending = false
-      for _, c in ipairs(line_comments) do
-        if c.is_local then
-          has_local_draft = true
-        elseif c.is_pending then
-          has_pending = true
+      for _, c in ipairs(comments) do
+        if c.line == line then
+          if c.is_local then
+            has_local_draft = true
+          elseif c.is_pending then
+            has_pending = true
+          end
         end
       end
 
-      local reactions_text = format_reactions_for_line(line_comments, line)
+      local reactions_text = format_reactions_for_line(comments, line)
 
       local text
       if M.config.show_icons then
@@ -2940,18 +2755,10 @@ local function display_comments(bufnr, comments)
         bg = comment_bg,
       })
 
-      local extmark_id = vim.api.nvim_buf_set_extmark(bufnr, ns_id, line_idx, 0, {
+      vim.api.nvim_buf_set_extmark(bufnr, ns_id, line_idx, 0, {
         virt_text = { { text, custom_hl_name } },
         virt_text_pos = "eol",
-        right_gravity = false,
       })
-
-      M._buffer_comment_threads[bufnr][extmark_id] = {
-        path = get_relative_path(bufnr),
-        original_line = line,
-        comments = vim.deepcopy(line_comments),
-        first_comment = line_comments[1],
-      }
     end
   end
 end
@@ -2962,18 +2769,21 @@ function M.show_comments_at_cursor()
   end
 
   local bufnr = vim.api.nvim_get_current_buf()
-  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
-  local line_comments = get_comment_thread_at_cursor(bufnr, cursor_line)
-
-  if #line_comments == 0 then
+  local comments = M._buffer_comments[bufnr]
+  if not comments or #comments == 0 then
     return
   end
 
-  local comment_by_id = {}
-  for _, comment in ipairs(line_comments) do
-    if comment.id then
-      comment_by_id[tostring(comment.id)] = comment
+  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
+  local line_comments = {}
+  for _, comment in ipairs(comments) do
+    if comment.line == cursor_line then
+      table.insert(line_comments, comment)
     end
+  end
+
+  if #line_comments == 0 then
+    return
   end
 
   local lines = {}
@@ -2981,30 +2791,21 @@ function M.show_comments_at_cursor()
     if i > 1 then
       table.insert(lines, string.rep("─", 40))
     end
-
-    local parent = comment.in_reply_to_id and comment_by_id[tostring(comment.in_reply_to_id)] or nil
-    local prefix = parent and "↳ " or ""
-    local timestamp = format_comment_timestamp(comment)
-    local status = comment.is_local and "draft" or (comment.is_pending and "pending" or nil)
-    local header = prefix .. (M.config.show_icons and string.format("👤 %s", comment.user) or string.format("@%s", comment.user))
-
-    if status then
-      header = header .. string.format(" [%s]", status)
+    if M.config.show_icons then
+      table.insert(lines, string.format("👤 %s", comment.user))
+    else
+      table.insert(lines, string.format("@%s", comment.user))
     end
-    if timestamp ~= "" then
-      header = header .. string.format(" · %s", timestamp)
-    end
-
-    table.insert(lines, header)
     table.insert(lines, "")
-    for _, body_line in ipairs(get_comment_body_lines(comment)) do
-      table.insert(lines, (parent and "  " or "") .. body_line)
+    for body_line in comment.body:gmatch("[^\r\n]+") do
+      table.insert(lines, body_line)
     end
 
+    -- Add reactions if present
     local reactions = format_comment_reactions(comment)
     if reactions ~= "" then
       table.insert(lines, "")
-      table.insert(lines, (parent and "  " or "") .. reactions)
+      table.insert(lines, reactions)
     end
   end
 
@@ -3086,10 +2887,9 @@ function M.add_reaction_to_comment()
   end
 
   local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
-  local thread_comments = get_comment_thread_at_cursor(bufnr, cursor_line)
   local line_comments = {}
-  for _, comment in ipairs(thread_comments) do
-    if not comment.is_pending and not comment.is_local then
+  for _, comment in ipairs(comments) do
+    if comment.line == cursor_line and not comment.is_pending and not comment.is_local then
       table.insert(line_comments, comment)
     end
   end
@@ -3144,39 +2944,25 @@ function M.load_comments_for_buffer(bufnr, force_reload)
   end
 
   local file_path = get_relative_path(bufnr)
-  if not file_path then
-    return
-  end
-
-  M._comment_request_seq = M._comment_request_seq + 1
-  local request_id = M._comment_request_seq
-  M._comment_request_ids[bufnr] = request_id
-
-  local function request_is_current()
-    return vim.api.nvim_buf_is_valid(bufnr)
-      and M._comment_request_ids[bufnr] == request_id
-      and vim.g.pr_review_number == pr_number
-  end
 
   -- Get regular comments
   github.get_comments_for_file(pr_number, file_path, function(comments, err)
-    if err or not request_is_current() then
+    if err then
       return
     end
 
+    -- Initialize comments if nil
     if not comments then
       comments = {}
     end
 
+    -- Also get pending comments and merge them
     github.get_pending_review_comments(pr_number, function(pending_comments, pending_err)
-      if not request_is_current() then
-        return
-      end
-
       debug_log(string.format("Debug load: Got %d pending comments, err=%s", #(pending_comments or {}),
         pending_err or "nil"))
 
       if not pending_err and pending_comments then
+        -- Filter pending comments for this file and mark them as pending
         local added_count = 0
         for _, pc in ipairs(pending_comments) do
           debug_log(string.format("Debug load: Pending comment path=%s, file_path=%s, line=%s", pc.path or "nil",
@@ -3191,26 +2977,26 @@ function M.load_comments_for_buffer(bufnr, force_reload)
         debug_log(string.format("Debug load: Added %d pending comments to buffer", added_count))
       end
 
+      -- Also merge local pending comments
       local local_pending = get_local_pending_comments_for_file(pr_number, file_path)
       debug_log(string.format("Debug load: Got %d local pending comments for file", #local_pending))
       for _, lpc in ipairs(local_pending) do
+        -- Local pending comments already have is_pending and is_local set
         table.insert(comments, lpc)
       end
 
-      sort_comments_for_display(comments)
-
       if comments and #comments > 0 then
         M._buffer_comments[bufnr] = comments
+        -- Use defer_fn with a delay to ensure diff highlights are applied first
         vim.defer_fn(function()
-          if request_is_current() then
+          if vim.api.nvim_buf_is_valid(bufnr) then
             display_comments(bufnr, comments)
           end
         end, 50)
       else
         M._buffer_comments[bufnr] = nil
-        M._buffer_comment_threads[bufnr] = nil
         vim.schedule(function()
-          if request_is_current() then
+          if vim.api.nvim_buf_is_valid(bufnr) then
             vim.api.nvim_buf_clear_namespace(bufnr, ns_id, 0, -1)
           end
         end)
@@ -3465,9 +3251,6 @@ function M.approve_pr()
     vim.notify("Not in review mode", vim.log.levels.WARN)
     return
   end
-  if not ensure_full_review_mode("Approving a PR") then
-    return
-  end
 
   -- Get local pending comments
   local pending_comments = get_local_pending_comments_for_pr(pr_number)
@@ -3526,9 +3309,6 @@ function M.request_changes()
   local pr_number = vim.g.pr_review_number
   if not pr_number then
     vim.notify("Not in review mode", vim.log.levels.WARN)
-    return
-  end
-  if not ensure_full_review_mode("Requesting changes") then
     return
   end
 
@@ -3595,9 +3375,6 @@ function M.submit_pending_comments()
     vim.notify("Not in review mode", vim.log.levels.WARN)
     return
   end
-  if not ensure_full_review_mode("Submitting pending comments") then
-    return
-  end
 
   -- Get local pending comments
   local pending_comments = get_local_pending_comments_for_pr(pr_number)
@@ -3650,9 +3427,6 @@ function M.add_comment()
   local pr_number = vim.g.pr_review_number
   if not pr_number then
     vim.notify("Not in review mode", vim.log.levels.WARN)
-    return
-  end
-  if not ensure_full_review_mode("Adding a PR comment") then
     return
   end
 
@@ -4378,9 +4152,6 @@ function M.add_review_comment()
     vim.notify("Not in review mode", vim.log.levels.WARN)
     return
   end
-  if not ensure_full_review_mode("Adding a line comment") then
-    return
-  end
 
   local bufnr = vim.api.nvim_get_current_buf()
   if is_before_buffer(bufnr) then
@@ -4461,9 +4232,6 @@ function M.add_pending_comment()
   local pr_number = vim.g.pr_review_number
   if not pr_number then
     vim.notify("Not in review mode", vim.log.levels.WARN)
-    return
-  end
-  if not ensure_full_review_mode("Adding a pending comment") then
     return
   end
 
@@ -4564,10 +4332,6 @@ function M.add_pending_comment()
 end
 
 function M.list_pending_comments()
-  if not ensure_full_review_mode("Listing pending comments") then
-    return
-  end
-
   -- Collect all pending comments from all PRs
   local all_comments = {}
   for pr_number, comments in pairs(M._local_pending_comments) do
@@ -4620,66 +4384,25 @@ function M.list_pending_comments()
   end)
 end
 
-local function navigate_to_comment_location(comment, notify_message)
-  if not comment or not comment.path or not comment.line then
+function M.list_all_comments()
+  local pr_number = vim.g.pr_review_number
+  if not pr_number then
+    vim.notify("Not in review mode", vim.log.levels.WARN)
     return
   end
 
-  local file_path = comment.path
-
-  local found_buf = nil
-  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-    if vim.api.nvim_buf_is_valid(buf) then
-      local buf_name = vim.api.nvim_buf_get_name(buf)
-      local cwd = vim.fn.getcwd()
-      if buf_name:sub(1, #cwd) == cwd then
-        buf_name = buf_name:sub(#cwd + 2)
-      end
-      if buf_name == file_path then
-        found_buf = buf
-        break
-      end
-    end
-  end
-
-  if found_buf then
-    local wins = vim.fn.win_findbuf(found_buf)
-    if #wins > 0 then
-      vim.api.nvim_set_current_win(wins[1])
-    else
-      vim.cmd("buffer " .. found_buf)
-    end
-  else
-    vim.cmd("edit " .. file_path)
-    found_buf = vim.api.nvim_get_current_buf()
-  end
-
-  local target_line = comment.line
-  if comment.extmark_id and found_buf and vim.api.nvim_buf_is_valid(found_buf) then
-    local pos = vim.api.nvim_buf_get_extmark_by_id(found_buf, ns_id, comment.extmark_id, {})
-    if pos and #pos > 0 then
-      target_line = pos[1] + 1
-    end
-  end
-
-  vim.api.nvim_win_set_cursor(0, { target_line, 0 })
-  vim.cmd("normal! zz")
-
-  if notify_message then
-    vim.notify(notify_message, vim.log.levels.INFO)
-  end
-end
-
-local function collect_all_pr_comments(pr_number, callback)
+  -- Fetch ALL comments from GitHub API (not just cached ones)
   github.fetch_pr_comments(pr_number, function(github_comments, err)
     if err then
-      callback(nil, err)
+      vim.notify("Failed to fetch PR comments: " .. err, vim.log.levels.ERROR)
       return
     end
 
     local all_comments = {}
 
+    -- Add all GitHub comments
     for _, comment in ipairs(github_comments or {}) do
+      -- Skip comments without line number (those are review-level comments)
       if comment.line then
         table.insert(all_comments, {
           id = comment.id,
@@ -4688,15 +4411,16 @@ local function collect_all_pr_comments(pr_number, callback)
           user = comment.user,
           body = comment.body,
           created_at = comment.created_at,
-          in_reply_to_id = comment.in_reply_to_id,
           is_local = false,
           bufnr = nil,
         })
       end
     end
 
+    -- Add local pending comments (but check for duplicates)
     local pending_comments = get_local_pending_comments_for_pr(pr_number)
     for _, pending in ipairs(pending_comments) do
+      -- Check if this comment already exists in GitHub comments
       local is_duplicate = false
       for _, posted in ipairs(all_comments) do
         if posted.path == pending.path and
@@ -4708,6 +4432,7 @@ local function collect_all_pr_comments(pr_number, callback)
         end
       end
 
+      -- Only add if not a duplicate
       if not is_duplicate then
         table.insert(all_comments, {
           id = pending.id,
@@ -4716,94 +4441,10 @@ local function collect_all_pr_comments(pr_number, callback)
           user = "You (PENDING)",
           body = pending.body,
           created_at = pending.created_at,
-          in_reply_to_id = pending.in_reply_to_id,
           is_local = true,
-          is_pending = pending.is_pending,
           bufnr = nil,
         })
       end
-    end
-
-    table.sort(all_comments, function(a, b)
-      if a.path ~= b.path then
-        return a.path < b.path
-      end
-      local a_line = a.line or math.huge
-      local b_line = b.line or math.huge
-      if a_line ~= b_line then
-        return a_line < b_line
-      end
-      local a_created = a.created_at or ""
-      local b_created = b.created_at or ""
-      if a_created ~= b_created then
-        return a_created < b_created
-      end
-      return tostring(a.id or "") < tostring(b.id or "")
-    end)
-
-    callback(all_comments, nil)
-  end)
-end
-
-local function collect_comment_locations(comments)
-  local locations = {}
-  local seen = {}
-
-  for bufnr, _ in pairs(M._buffer_comment_threads) do
-    if vim.api.nvim_buf_is_valid(bufnr) then
-      for _, thread in ipairs(get_anchored_comment_threads(bufnr)) do
-        local key = string.format("%s:%s", thread.path or "", thread.original_line or thread.line)
-        if thread.path and thread.line and not seen[key] then
-          seen[key] = true
-          table.insert(locations, {
-            path = thread.path,
-            line = thread.line,
-            original_line = thread.original_line,
-            first_comment = thread.first_comment,
-            bufnr = thread.bufnr,
-            extmark_id = thread.extmark_id,
-          })
-        end
-      end
-    end
-  end
-
-  for _, comment in ipairs(comments or {}) do
-    if comment.path and comment.line then
-      local key = string.format("%s:%s", comment.path, comment.line)
-      if not seen[key] then
-        seen[key] = true
-        table.insert(locations, {
-          path = comment.path,
-          line = comment.line,
-          original_line = comment.line,
-          first_comment = comment,
-        })
-      end
-    end
-  end
-
-  table.sort(locations, function(a, b)
-    if a.path ~= b.path then
-      return a.path < b.path
-    end
-    return a.line < b.line
-  end)
-
-  return locations
-end
-
-function M.list_all_comments()
-  local pr_number = vim.g.pr_review_number
-  if not pr_number then
-    vim.notify("Not in review mode", vim.log.levels.WARN)
-    return
-  end
-
-  collect_all_pr_comments(pr_number, function(all_comments, err)
-    if err then
-      vim.notify("Failed to fetch PR comments: " .. err, vim.log.levels.ERROR)
-      return
     end
 
     if #all_comments == 0 then
@@ -4811,102 +4452,65 @@ function M.list_all_comments()
       return
     end
 
+    -- Sort by file path, then line number
+    table.sort(all_comments, function(a, b)
+      if a.path ~= b.path then
+        return a.path < b.path
+      end
+      return a.line < b.line
+    end)
+
+    -- Use the UI picker to select a comment
     ui.select_all_comments(all_comments, M.config.picker, function(selected_comment)
       if not selected_comment then
         return
       end
 
+      -- Navigate to the file and line
+      local file_path = selected_comment.path
+
+      -- Try to find buffer with this file
+      local found_buf = nil
+      for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_valid(buf) then
+          local buf_name = vim.api.nvim_buf_get_name(buf)
+          -- Make path relative to cwd
+          local cwd = vim.fn.getcwd()
+          if buf_name:sub(1, #cwd) == cwd then
+            buf_name = buf_name:sub(#cwd + 2)
+          end
+          if buf_name == file_path then
+            found_buf = buf
+            break
+          end
+        end
+      end
+
+      -- Open the file
+      if found_buf then
+        -- File is already open in a buffer, find or create a window for it
+        local wins = vim.fn.win_findbuf(found_buf)
+        if #wins > 0 then
+          vim.api.nvim_set_current_win(wins[1])
+        else
+          vim.cmd("buffer " .. found_buf)
+        end
+      else
+        -- Open the file
+        vim.cmd("edit " .. file_path)
+      end
+
+      -- Navigate to the line
+      vim.api.nvim_win_set_cursor(0, { selected_comment.line, 0 })
+      vim.cmd("normal! zz")
+
+      -- Show notification with comment info
       local status = selected_comment.is_local and "PENDING" or "Posted"
-      navigate_to_comment_location(
-        selected_comment,
-        string.format("[%s] %s:%d - %s", status, selected_comment.path, selected_comment.line, selected_comment.user)
+      vim.notify(
+        string.format("[%s] %s:%d - %s", status, file_path, selected_comment.line, selected_comment.user),
+        vim.log.levels.INFO
       )
     end)
-  end)
-end
-
-function M.prev_comment()
-  local pr_number = vim.g.pr_review_number
-  if not pr_number then
-    vim.notify("Not in review mode", vim.log.levels.WARN)
-    return
-  end
-
-  collect_all_pr_comments(pr_number, function(all_comments, err)
-    if err then
-      vim.notify("Failed to fetch PR comments: " .. err, vim.log.levels.ERROR)
-      return
-    end
-
-    local locations = collect_comment_locations(all_comments)
-    if #locations == 0 then
-      vim.notify("No comments in this PR", vim.log.levels.INFO)
-      return
-    end
-
-    local current_path = get_relative_path(vim.api.nvim_get_current_buf()) or ""
-    local current_line = vim.api.nvim_win_get_cursor(0)[1]
-    local target = nil
-
-    for i = #locations, 1, -1 do
-      local location = locations[i]
-      if location.path < current_path or (location.path == current_path and location.line < current_line) then
-        target = location
-        break
-      end
-    end
-
-    if not target then
-      target = locations[#locations]
-      vim.notify("Wrapped to last commented location", vim.log.levels.INFO)
-    end
-
-    navigate_to_comment_location(
-      target.first_comment,
-      string.format("Previous comment: %s:%d", target.path, target.line)
-    )
-  end)
-end
-
-function M.next_comment()
-  local pr_number = vim.g.pr_review_number
-  if not pr_number then
-    vim.notify("Not in review mode", vim.log.levels.WARN)
-    return
-  end
-
-  collect_all_pr_comments(pr_number, function(all_comments, err)
-    if err then
-      vim.notify("Failed to fetch PR comments: " .. err, vim.log.levels.ERROR)
-      return
-    end
-
-    local locations = collect_comment_locations(all_comments)
-    if #locations == 0 then
-      vim.notify("No comments in this PR", vim.log.levels.INFO)
-      return
-    end
-
-    local current_path = get_relative_path(vim.api.nvim_get_current_buf()) or ""
-    local current_line = vim.api.nvim_win_get_cursor(0)[1]
-    local target = nil
-
-    for _, location in ipairs(locations) do
-      if location.path > current_path or (location.path == current_path and location.line > current_line) then
-        target = location
-        break
-      end
-    end
-
-    if not target then
-      target = locations[1]
-      vim.notify("Wrapped to first commented location", vim.log.levels.INFO)
-    end
-
-    navigate_to_comment_location(
-      target.first_comment,
-      string.format("Next comment: %s:%d", target.path, target.line)
-    )
   end)
 end
 
@@ -4915,9 +4519,6 @@ function M.list_global_comments()
   local pr_number = vim.g.pr_review_number
   if not pr_number then
     vim.notify("Not in review mode", vim.log.levels.WARN)
-    return
-  end
-  if not ensure_full_review_mode("Viewing global PR comments") then
     return
   end
 
@@ -5075,7 +4676,12 @@ function M.reply_to_comment()
   end
 
   local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
-  local line_comments, thread = get_comment_thread_at_cursor(bufnr, cursor_line)
+  local line_comments = {}
+  for _, comment in ipairs(comments) do
+    if comment.line == cursor_line then
+      table.insert(line_comments, comment)
+    end
+  end
 
   if #line_comments == 0 then
     vim.notify("No comments on this line", vim.log.levels.WARN)
@@ -5106,7 +4712,7 @@ function M.reply_to_comment()
     end, {
       pr_number = pr_number,
       file_path = file_path,
-      line = (thread and thread.original_line) or comment.line or cursor_line,
+      line = cursor_line,
       action = "reply",
       comment_id = comment.id,
     })
@@ -5131,9 +4737,6 @@ function M.edit_my_comment()
   local pr_number = vim.g.pr_review_number
   if not pr_number then
     vim.notify("Not in review mode", vim.log.levels.WARN)
-    return
-  end
-  if not ensure_full_review_mode("Editing comments") then
     return
   end
 
@@ -5382,9 +4985,6 @@ function M.delete_my_comment()
     vim.notify("Not in review mode", vim.log.levels.WARN)
     return
   end
-  if not ensure_full_review_mode("Deleting comments") then
-    return
-  end
 
   local bufnr = vim.api.nvim_get_current_buf()
   local comments = M._buffer_comments[bufnr]
@@ -5490,32 +5090,26 @@ function M.show_session_info()
 end
 
 function M.load_last_session()
+  -- Check if we're on a review branch
+  local current_branch = git.get_current_branch()
+  local on_review_branch = current_branch and current_branch:match("^" .. M.config.branch_prefix)
+
+  if not on_review_branch then
+    vim.notify("Not on a review branch. Use :PR to start a new review.", vim.log.levels.WARN)
+    return
+  end
+
+  if vim.g.pr_review_number then
+    vim.notify("Already in review mode.", vim.log.levels.INFO)
+    -- Just open the review buffer
+    M.open_review_buffer()
+    return
+  end
+
   local session_data = load_session()
 
   if not session_data then
     vim.notify("No saved session found for this project", vim.log.levels.INFO)
-    return
-  end
-
-  local review_mode = session_data.review_mode or (session_data.review_branch and "review_branch") or nil
-
-  if review_mode ~= "comment_overlay" then
-    local current_branch = git.get_current_branch()
-    local on_review_branch = current_branch and current_branch:match("^" .. M.config.branch_prefix)
-    if not on_review_branch then
-      vim.notify("Not on a review branch. Use :PR to start a new review.", vim.log.levels.WARN)
-      return
-    end
-  end
-
-  if vim.g.pr_review_number then
-    if is_comment_overlay_mode() then
-      vim.notify("Already in comment overlay mode.", vim.log.levels.INFO)
-      return
-    end
-
-    vim.notify("Already in review mode.", vim.log.levels.INFO)
-    M.open_review_buffer()
     return
   end
 
@@ -5525,20 +5119,12 @@ function M.load_last_session()
     return
   end
 
-  vim.notify("Restoring session for PR #" .. session_data.pr_number .. "...", vim.log.levels.INFO)
+  vim.notify("Restoring review session for PR #" .. session_data.pr_number .. "...", vim.log.levels.INFO)
 
-  if not apply_session_data(session_data) then
-    return
-  end
+  apply_session_data(session_data)
 
   -- Start polling for remote updates
   start_update_polling()
-
-  if is_comment_overlay_mode() then
-    open_saved_active_file(session_data)
-    vim.notify("✅ Comment overlay restored for PR #" .. session_data.pr_number, vim.log.levels.INFO)
-    return
-  end
 
   -- Open review buffer and first file
   M.open_review_buffer(function()
@@ -5572,12 +5158,10 @@ function M.suspend_review_session()
   M._review_window = nil
 
   vim.g.pr_review_number = nil
-  vim.g.pr_review_mode = nil
   vim.g.pr_review_base_branch = nil
   vim.g.pr_review_previous_branch = nil
   vim.g.pr_review_branch = nil
   vim.g.pr_review_repo_root = nil
-  vim.g.pr_review_merge_base = nil
   vim.g.pr_review_modified_files = nil
 
   close_float_wins()
@@ -5600,14 +5184,7 @@ function M.resume_review_session()
     return false
   end
 
-  if not apply_session_data(session_data) then
-    return false
-  end
-
-  if is_comment_overlay_mode() then
-    open_saved_active_file(session_data)
-    return true
-  end
+  apply_session_data(session_data)
 
   M.open_review_buffer(function()
     open_saved_active_file(session_data)
@@ -5621,9 +5198,6 @@ function M.show_pr_info()
   local pr_number = vim.g.pr_review_number
   if not pr_number then
     vim.notify("Not in review mode", vim.log.levels.WARN)
-    return
-  end
-  if not ensure_full_review_mode("PR info") then
     return
   end
 
@@ -5882,9 +5456,6 @@ function M.open_pr()
     vim.notify("Not in review mode", vim.log.levels.WARN)
     return
   end
-  if not ensure_full_review_mode("Opening the PR") then
-    return
-  end
 
   local cmd = string.format("gh pr view %d --web", pr_number)
   vim.fn.jobstart(cmd, {
@@ -6046,7 +5617,6 @@ function M._do_start_review(pr)
         end
 
         vim.g.pr_review_number = pr.number
-        vim.g.pr_review_mode = "review_branch"
         vim.g.pr_review_base_branch = pr.base_branch
         vim.g.pr_review_branch = review_branch
         vim.g.pr_review_repo_root = git.get_repo_root()
@@ -6086,212 +5656,8 @@ function M._do_start_review(pr)
   end)
 end
 
--- Re-anchor comment overlay indicators by stashing, reloading on clean content, and popping stash
-function M.reanchor_comment_overlay()
-  if vim.g.pr_review_mode ~= "comment_overlay" then
-    vim.notify("Re-anchoring is only available in comment overlay mode", vim.log.levels.WARN)
-    return
-  end
-
-  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-    if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].modified then
-      vim.notify("Save or discard modified buffers before re-anchoring comment overlay", vim.log.levels.WARN)
-      return
-    end
-  end
-
-  local function reload_overlay_buffers()
-    vim.notify("Reloading comments on clean content...", vim.log.levels.INFO)
-    vim.cmd("checktime")
-
-    local current_win = vim.api.nvim_get_current_win()
-    local current_buf = vim.api.nvim_get_current_buf()
-    local targets = {}
-    local seen = {}
-
-    local function add_target(bufnr)
-      if bufnr and bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr) and not seen[bufnr] then
-        seen[bufnr] = true
-        table.insert(targets, bufnr)
-      end
-    end
-
-    add_target(current_buf)
-
-    for _, file in ipairs(M._review_files or {}) do
-      if file.path and file.path ~= "" then
-        local abs_path = vim.fn.fnamemodify(file.path, ":p")
-        local bufnr = vim.fn.bufadd(abs_path)
-        if bufnr > 0 then
-          pcall(vim.fn.bufload, bufnr)
-          add_target(bufnr)
-        end
-      end
-    end
-
-    for _, bufnr in ipairs(targets) do
-      M.load_comments_for_buffer(bufnr, true)
-    end
-
-    if current_win and vim.api.nvim_win_is_valid(current_win) then
-      vim.api.nvim_set_current_win(current_win)
-    end
-  end
-
-  if not git.has_uncommitted_changes() then
-    reload_overlay_buffers()
-    return
-  end
-
-  local choice = vim.fn.confirm("Stash local changes to re-anchor comments?", "&Yes\n&No", 2)
-  if choice ~= 1 then
-    return
-  end
-
-  vim.notify("Stashing local changes...", vim.log.levels.INFO)
-  vim.fn.jobstart("git stash push -u -m 'PR-Reviewer auto-stash for re-anchoring'", {
-    on_exit = function(_, code)
-      vim.schedule(function()
-        if code ~= 0 then
-          vim.notify("Failed to stash changes. Aborting re-anchor.", vim.log.levels.ERROR)
-          return
-        end
-
-        reload_overlay_buffers()
-
-        vim.notify("Restoring local changes from stash...", vim.log.levels.INFO)
-        vim.fn.jobstart("git stash pop", {
-          on_exit = function(_, pop_code)
-            vim.schedule(function()
-              vim.cmd("checktime")
-              if pop_code ~= 0 then
-                vim.notify("Stash pop had conflicts or failed. Please check 'git stash list'.", vim.log.levels.WARN)
-              else
-                vim.notify("Successfully re-anchored comments and restored changes.", vim.log.levels.INFO)
-              end
-            end)
-          end
-        })
-      end)
-    end
-  })
-end
-
--- Start comments mode for the current branch
-function M.start_comment_overlay()
-  vim.notify("Resolving PR for current branch...", vim.log.levels.INFO)
-
-  github.get_pr_for_current_branch(function(pr, err)
-    if err or not pr then
-      vim.notify(err or "Failed to find PR for current branch", vim.log.levels.ERROR)
-      return
-    end
-
-    local current_repo_root = git.get_repo_root()
-
-    if vim.g.pr_review_number then
-      if vim.g.pr_review_number == pr.number and
-          vim.g.pr_review_mode == "comment_overlay" and
-          vim.g.pr_review_repo_root == current_repo_root then
-        vim.notify("Already in comment overlay mode for PR #" .. pr.number, vim.log.levels.INFO)
-        local current_buf = vim.api.nvim_get_current_buf()
-        local file_path = get_relative_path(current_buf)
-        if file_path then
-          M.load_comments_for_buffer(current_buf, true)
-        end
-        return
-      end
-
-      vim.notify(string.format("Cleaning up current review (PR #%d) to start PR #%d...",
-        vim.g.pr_review_number, pr.number), vim.log.levels.INFO)
-      M.cleanup_review_branch(function(cleaned)
-        if cleaned then
-          M.start_comment_overlay()
-        end
-      end)
-      return
-    end
-
-    local current_branch = git.get_current_branch()
-
-    git.fetch_all(function(fetch_ok, fetch_err)
-      if not fetch_ok then
-        vim.notify("Failed to fetch base branch: " .. (fetch_err or "unknown"), vim.log.levels.ERROR)
-        return
-      end
-
-      local merge_base = git.get_merge_base(pr.base_branch, "HEAD")
-      if not merge_base then
-        vim.notify("Failed to compute merge base for PR #" .. pr.number .. ". Fetch the base branch and try again.",
-          vim.log.levels.ERROR)
-        return
-      end
-
-      reset_review_runtime_state()
-
-      vim.notify("Starting comment overlay mode for PR #" .. pr.number .. "...", vim.log.levels.INFO)
-
-      vim.g.pr_review_number = pr.number
-      vim.g.pr_review_mode = "comment_overlay"
-      vim.g.pr_review_base_branch = pr.base_branch
-      vim.g.pr_review_previous_branch = current_branch
-      vim.g.pr_review_branch = nil -- No temp review branch
-      vim.g.pr_review_repo_root = current_repo_root
-      vim.g.pr_review_merge_base = merge_base
-
-      -- Start polling for remote updates
-      start_update_polling()
-
-      vim.notify(
-        string.format("✅ Comment addressing active for PR #%s: %s", pr.number, pr.title),
-        vim.log.levels.INFO
-      )
-
-      git.get_modified_files_with_lines(function(files)
-        M._review_files = (files and #files > 0) and vim.tbl_map(function(f)
-          return {
-            path = f.path,
-            status = f.status,
-            viewed = M._viewed_files[f.path] or false,
-            stats = { additions = 0, modifications = 0, deletions = 0 },
-          }
-        end, files) or {}
-        M._review_files_ordered = {}
-
-        vim.g.pr_review_modified_files = (files and #files > 0) and vim.tbl_map(function(f)
-          return { path = f.path, status = f.status }
-        end, files) or {}
-
-        save_session()
-
-        local current_buf = vim.api.nvim_get_current_buf()
-        local file_path = get_relative_path(current_buf)
-        if file_path then
-          M.load_comments_for_buffer(current_buf, true)
-          vim.api.nvim_buf_clear_namespace(current_buf, changes_ns_id, 0, -1)
-          vim.api.nvim_buf_clear_namespace(current_buf, diff_ns_id, 0, -1)
-          vim.api.nvim_buf_clear_namespace(current_buf, hunk_hints_ns_id, 0, -1)
-          close_float_wins()
-        end
-
-        if not files or #files == 0 then
-          vim.notify("No modified files found for the current branch PR", vim.log.levels.WARN)
-        end
-      end)
-    end)
-  end)
-end
-
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
-
-  vim.api.nvim_create_user_command("PRCommentOverlay", function()
-    M.start_comment_overlay()
-  end, { desc = "Enable comment overlay for the PR on current branch" })
-
-  vim.api.nvim_create_user_command("PRReanchorCommentOverlay", function()
-    M.reanchor_comment_overlay()
-  end, { desc = "Re-anchor comment overlay by stashing and reloading on clean content" })
 
   vim.api.nvim_create_user_command("PRReview", function()
     M.review_pr()
@@ -6337,18 +5703,6 @@ function M.setup(opts)
     M.list_pending_comments()
   end, { desc = "List all pending comments and navigate to selected one" })
 
-  vim.api.nvim_create_user_command("PRListComments", function()
-    M.list_all_comments()
-  end, { desc = "List comments and navigate to selected one" })
-
-  vim.api.nvim_create_user_command("PRNextComment", function()
-    M.next_comment()
-  end, { desc = "Jump to the next commented location" })
-
-  vim.api.nvim_create_user_command("PRPrevComment", function()
-    M.prev_comment()
-  end, { desc = "Jump to the previous commented location" })
-
   vim.api.nvim_create_user_command("PRListAllComments", function()
     M.list_all_comments()
   end, { desc = "List all comments (pending + posted) with preview" })
@@ -6385,10 +5739,6 @@ function M.setup(opts)
   -- Recommended keybind: vim.keymap.set('v', '<leader>gs', ':<C-u>\'<,\'>PRSuggestChange<CR>', { desc = 'Suggest change' })
   -- This ensures the range is always passed correctly
   vim.api.nvim_create_user_command("PRSuggestChange", function(args)
-    if not ensure_full_review_mode("Suggesting a code change") then
-      return
-    end
-
     local start_line, end_line
 
     -- Get visual selection from range if provided (when called with ':<,'>PRSuggestChange')
@@ -6466,9 +5816,6 @@ function M.setup(opts)
   end, { desc = "Refresh PR branch with latest changes" })
 
   vim.api.nvim_create_user_command("PRReviewBuffer", function()
-    if not ensure_full_review_mode("Opening the review buffer") then
-      return
-    end
     M.open_review_buffer()
   end, { desc = "Open PR review buffer" })
 
@@ -6480,15 +5827,8 @@ function M.setup(opts)
     group = augroup,
     callback = function(args)
       if vim.g.pr_review_number then
-        M.load_comments_for_buffer(args.buf)
 
-        if vim.g.pr_review_mode == "comment_overlay" then
-          vim.api.nvim_buf_clear_namespace(args.buf, changes_ns_id, 0, -1)
-          vim.api.nvim_buf_clear_namespace(args.buf, diff_ns_id, 0, -1)
-          vim.api.nvim_buf_clear_namespace(args.buf, hunk_hints_ns_id, 0, -1)
-          close_float_wins()
-          return
-        end
+        M.load_comments_for_buffer(args.buf)
 
         -- Always load changes (for hunks data needed by floats)
         -- Visual indicators (│) are only added when not in split mode (handled in load_changes_for_buffer)
@@ -6567,7 +5907,7 @@ function M.setup(opts)
   vim.api.nvim_create_autocmd("CursorMoved", {
     group = augroup,
     callback = function()
-      if vim.g.pr_review_number and vim.g.pr_review_mode ~= "comment_overlay" then
+      if vim.g.pr_review_number then
         update_hunk_navigation_hints()
         update_changes_float()
       end
@@ -6587,9 +5927,7 @@ function M.setup(opts)
       -- Clean up tracking when buffer is deleted
       M._buffer_keymaps_saved[args.buf] = nil
       M._buffer_jumped[args.buf] = nil
-      M._comment_request_ids[args.buf] = nil
       M._inline_diff_request_ids[args.buf] = nil
-      M._buffer_comment_threads[args.buf] = nil
       M._buffer_comments[args.buf] = nil
       M._buffer_changes[args.buf] = nil
       M._buffer_hunks[args.buf] = nil
@@ -6693,7 +6031,6 @@ function M._do_review_pr_with_branch(pr)
         end
 
         vim.g.pr_review_number = pr.number
-        vim.g.pr_review_mode = "review_branch"
         vim.g.pr_review_base_branch = pr.base_branch
         vim.g.pr_review_branch = review_branch
         vim.g.pr_review_repo_root = git.get_repo_root()
@@ -6744,11 +6081,6 @@ function M.refresh_pr_branch()
   local base_branch = vim.g.pr_review_base_branch
   if not base_branch then
     vim.notify("❌ Base branch not found", vim.log.levels.ERROR)
-    return
-  end
-
-  if vim.g.pr_review_mode == "comment_overlay" then
-    vim.notify("Refresh is only available on generated review branches. Update your local branch manually while using comment overlay mode.", vim.log.levels.WARN)
     return
   end
 
@@ -6857,24 +6189,7 @@ function M.refresh_pr_branch()
   end)
 end
 
-function M.cleanup_review_branch(callback)
-  callback = callback or function() end
-
-  if vim.g.pr_review_mode == "comment_overlay" then
-    local choice = vim.fn.confirm("Exit comment overlay mode?", "&Yes\n&No", 2)
-    if choice ~= 1 then
-      callback(false)
-      return false
-    end
-
-    delete_session()
-    stop_update_polling()
-    reset_review_runtime_state()
-    vim.notify("Exited comment overlay mode", vim.log.levels.INFO)
-    callback(true)
-    return true
-  end
-
+function M.cleanup_review_branch()
   local current = git.get_current_branch()
   local current_repo_root = git.get_repo_root()
   local stored_review_branch = vim.g.pr_review_branch
@@ -6887,20 +6202,17 @@ function M.cleanup_review_branch(callback)
         review_branch = current
       else
         vim.notify("Saved review session is missing repository metadata", vim.log.levels.WARN)
-        callback(false)
-        return false
+        return
       end
     else
       if not current_repo_root or stored_repo_root ~= current_repo_root then
         vim.notify("Review session belongs to a different repository", vim.log.levels.WARN)
-        callback(false)
-        return false
+        return
       end
 
       if current and current ~= "" and current ~= stored_review_branch then
         vim.notify("Not on the active review branch", vim.log.levels.WARN)
-        callback(false)
-        return false
+        return
       end
 
       review_branch = stored_review_branch
@@ -6911,15 +6223,13 @@ function M.cleanup_review_branch(callback)
 
   if not review_branch then
     vim.notify("Not on a review branch", vim.log.levels.WARN)
-    callback(false)
-    return false
+    return
   end
 
   -- Confirm before exiting review
   local choice = vim.fn.confirm("Exit review and cleanup branch?", "&Yes\n&No", 2)
   if choice ~= 1 then
-    callback(false)
-    return false
+    return
   end
 
   local target = vim.g.pr_review_previous_branch or "master"
@@ -6931,13 +6241,10 @@ function M.cleanup_review_branch(callback)
       reset_review_runtime_state()
 
       vim.notify("Cleaned up review branch, back on: " .. target, vim.log.levels.INFO)
-      callback(true)
     else
       vim.notify("Error cleaning up: " .. (err or "unknown"), vim.log.levels.ERROR)
-      callback(false)
     end
   end)
-  return true
 end
 
 -- Menu buffer state
@@ -7124,7 +6431,6 @@ function M.show_review_menu()
       table.insert(items, { key = "l", desc = "List Pull Requests",             cmd = function() M.review_pr() end })
     end
     table.insert(items, { key = "r", desc = "List Pull Requests with Assignee", cmd = function() M.list_review_requests() end })
-    table.insert(items, { key = "c", desc = "Comment Overlay (Current Branch)", cmd = function() M.start_comment_overlay() end })
 
     sections = {
       {
@@ -7134,61 +6440,45 @@ function M.show_review_menu()
     }
   else
     -- In review mode - show review actions
-    if is_comment_overlay_mode() then
-      sections = {
-        {
-          title = "Comment Overlay",
-          items = {
-            { key = "l", desc = "List Comments",    cmd = function() M.list_all_comments() end },
-            { key = "n", desc = "Next Comment",     cmd = function() M.next_comment() end },
-            { key = "p", desc = "Prev Comment",     cmd = function() M.prev_comment() end },
-            { key = "r", desc = "Reply to Comment", cmd = function() M.reply_to_comment() end },
-            { key = "R", desc = "Toggle Reaction",  cmd = function() M.add_reaction_to_comment() end },
-            { key = "e", desc = "Exit Overlay",     cmd = function() M.cleanup_review_branch() end },
-          }
-        },
-      }
-    else
-      sections = {
-        {
-          title = "Pull Request",
-          items = {
-            { key = "i", desc = "PR Info",            cmd = function() M.show_pr_info() end },
-            { key = "o", desc = "Open PR in Browser", cmd = function() M.open_pr() end },
-            { key = "c", desc = "Comment on PR",      cmd = function() M.add_comment() end },
-            { key = "a", desc = "Approve PR",         cmd = function() M.approve_pr() end },
-            { key = "x", desc = "Request Changes",    cmd = function() M.request_changes() end },
-            { key = "e", desc = "Exit Review",        cmd = function() M.cleanup_review_branch() end },
-          }
-        },
-        {
-          title = "General",
-          items = {
-            { key = "b", desc = "Toggle Review Buffer", cmd = function() M.toggle_review_buffer() end },
-            { key = "f", desc = "Refresh PR Branch",    cmd = function() M.refresh_pr_branch() end },
-          }
-        },
-        {
-          title = "Line Comment",
-          items = {
-            { key = "l", desc = "Add Line Comment",    cmd = function() M.add_review_comment() end },
-            { key = "p", desc = "Add Pending Comment", cmd = function() M.add_pending_comment() end },
-            { key = "r", desc = "Reply to Comment",    cmd = function() M.reply_to_comment() end },
-            { key = "m", desc = "Edit My Comment",     cmd = function() M.edit_my_comment() end },
-            { key = "d", desc = "Delete Comment",      cmd = function() M.delete_my_comment() end },
-            { key = "R", desc = "Toggle Reaction",     cmd = function() M.add_reaction_to_comment() end },
-          }
-        },
-        {
-          title = "Comments",
-          items = {
-            { key = "s", desc = "Submit Pending Comments", cmd = function() M.submit_pending_comments() end },
-            { key = "v", desc = "List All Comments",       cmd = function() M.list_all_comments() end },
-            { key = "g", desc = "Global PR Comments",      cmd = function() M.list_global_comments() end },
-          }
-        },
-      }
-    end
+    sections = {
+      {
+        title = "Pull Request",
+        items = {
+          { key = "i", desc = "PR Info",            cmd = function() M.show_pr_info() end },
+          { key = "o", desc = "Open PR in Browser", cmd = function() M.open_pr() end },
+          { key = "c", desc = "Comment on PR",      cmd = function() M.add_comment() end },
+          { key = "a", desc = "Approve PR",         cmd = function() M.approve_pr() end },
+          { key = "x", desc = "Request Changes",    cmd = function() M.request_changes() end },
+          { key = "e", desc = "Exit Review",        cmd = function() M.cleanup_review_branch() end },
+        }
+      },
+      {
+        title = "General",
+        items = {
+          { key = "b", desc = "Toggle Review Buffer", cmd = function() M.toggle_review_buffer() end },
+          { key = "f", desc = "Refresh PR Branch",    cmd = function() M.refresh_pr_branch() end },
+        }
+      },
+      {
+        title = "Line Comment",
+        items = {
+          { key = "l", desc = "Add Line Comment",    cmd = function() M.add_review_comment() end },
+          { key = "p", desc = "Add Pending Comment", cmd = function() M.add_pending_comment() end },
+          { key = "r", desc = "Reply to Comment",    cmd = function() M.reply_to_comment() end },
+          { key = "m", desc = "Edit My Comment",     cmd = function() M.edit_my_comment() end },
+          { key = "d", desc = "Delete Comment",      cmd = function() M.delete_my_comment() end },
+          { key = "R", desc = "Toggle Reaction",     cmd = function() M.add_reaction_to_comment() end },
+        }
+      },
+      {
+        title = "Comments",
+        items = {
+          { key = "s", desc = "Submit Pending Comments", cmd = function() M.submit_pending_comments() end },
+          { key = "v", desc = "List All Comments",       cmd = function() M.list_all_comments() end },
+          { key = "g", desc = "Global PR Comments",      cmd = function() M.list_global_comments() end },
+        }
+      },
+    }
   end
 
   show_menu_window(sections)
